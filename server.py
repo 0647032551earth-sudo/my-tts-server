@@ -29,7 +29,7 @@ MAX_TEXT = 5000        # ตัวอักษรต่อคำขอ (หน�
 MAX_PARALLEL = 3       # งานพร้อมกันฝั่งเซิร์ฟเวอร์ (เดิม 6) ลดการโดน Microsoft ตัด
 PIECE_MAX = 500        # ขนาดท่อนย่อยที่ส่งให้ Microsoft ทีละครั้ง
 TRIES = 4              # ลองซ้ำต่อท่อน
-ATTEMPT_TIMEOUT = 25   # วินาทีต่อการลอง 1 ครั้ง
+ATTEMPT_TIMEOUT = 12   # วินาทีต่อการลอง 1 ครั้ง (ปกติเสร็จใน 1-3 วินาที ถ้าค้างให้ตัดแล้วลองใหม่เร็วๆ)
 REQUEST_BUDGET = 36    # วินาทีรวมต่อคำขอ (หน้าเว็บตัดที่ 40 วินาที)
 gate = threading.BoundedSemaphore(MAX_PARALLEL)
 
@@ -108,7 +108,7 @@ def synth_piece(text, voice, rate, pitch, deadline):
                 synth(text, voice, rate, pitch), timeout=min(ATTEMPT_TIMEOUT, remaining)))
         except Exception as e:  # noqa
             last = e
-            print("piece fail try %d/%d (%d chars): %s" % (k, TRIES, len(text), str(e)[:120]), flush=True)
+            print("piece fail try %d/%d (%d chars): %s" % (k, TRIES, len(text), (str(e) or type(e).__name__)[:120]), flush=True)
             time.sleep(min(6.0, 0.8 * (2 ** (k - 1))) + random.random() * 0.5)
     raise last or RuntimeError("time budget exceeded")
 
@@ -194,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             audio = build_audio(text, voice, rate, pitch, deadline)
         except Exception as e:  # noqa
-            return self._send(502, {"error": "Failed to generate speech.", "detail": str(e)[:300]})
+            return self._send(502, {"error": "Failed to generate speech.", "detail": (str(e) or type(e).__name__)[:300]})
         finally:
             gate.release()
         self._send(200, audio, "audio/mpeg")
