@@ -6,10 +6,11 @@ from bs4 import BeautifulSoup
 import urllib.parse
 import re
 import os
+import time
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Fast Real Progress)", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Live ETA Timer)", page_icon="🌐")
 
-st.title("🌐 ระบบดึงนิยาย (ระบุช่วงตอน) + แปลไทย + สร้างเสียงเปรมวดี (เร่งความเร็ว + เปอร์เซ็นต์จริง)")
+st.title("🌐 ระบบดึงนิยาย + แปลไทย + สร้างเสียงเปรมวดี (จับเวลา & คำนวณเวลาเสร็จจริง)")
 
 # กำหนดค่าเริ่มต้นใน session_state ป้องกันข้อมูลหาย
 if "novel_text" not in st.session_state:
@@ -146,40 +147,58 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# 4. ฟังก์ชันสร้างเสียงแบบคู่ขนาน (รวดเร็วขึ้น + ได้เปอร์เซ็นต์จริง)
-async def generate_audio_chunks_fast(text_content, voice, output_filename, progress_bar, status_text):
-    # ขยายขนาดท่อนเป็น 3,000 ตัวอักษรต่อท่อน เพื่อลดจำนวนครั้งในการวนลูป
+# 4. ฟังก์ชันสร้างเสียง พร้อมระบบคำนวณเวลา อัตราความเร็ว และ ETA
+async def generate_audio_chunks_with_eta(text_content, voice, output_filename, progress_bar, status_text):
     chunk_size = 3000
     text_chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
     total_chunks = len(text_chunks)
+    total_chars = len(text_content)
     
     if total_chunks == 0:
         return False
 
     temp_files = [f"temp_part_{idx}.mp3" for idx in range(total_chunks)]
     
-    # ฟังก์ชันช่วยแปลงทีละท่อน
     async def process_chunk(idx, chunk):
         communicate = edge_tts.Communicate(chunk, voice)
         await communicate.save(temp_files[idx])
 
-    # แบ่งงานทำเป็นกลุ่ม (ครั้งละ 4 ท่อนพร้อมกัน) เพื่อความเร็วสูงสุด
     batch_size = 4
     completed_count = 0
+    processed_chars = 0
+    start_time = time.time()
     
     for i in range(0, total_chunks, batch_size):
         batch_indices = range(i, min(i + batch_size, total_chunks))
         
-        # อัปเดตสถานะและเปอร์เซ็นต์ตามความคืบหน้าจริง
+        # คำนวณเวลาที่ใช้ไป (Elapsed Time)
+        elapsed_time = time.time() - start_time
+        
+        # คำนวณความเร็ว (ตัวอักษรต่อวินาที)
+        chars_per_sec = processed_chars / elapsed_time if elapsed_time > 0 else 0
+        
+        # คำนวณเวลาที่เหลือ (ETA)
+        remaining_chars = total_chars - processed_chars
+        eta_seconds = remaining_chars / chars_per_sec if chars_per_sec > 0 else 0
+        
         current_pct = int((completed_count / total_chunks) * 100)
         progress_bar.progress(max(current_pct, 1))
-        status_text.text(f"🎧 กำลังสังเคราะห์เสียงกลุ่มท่อนที่ {i+1} ถึง {min(i+batch_size, total_chunks)} จาก {total_chunks} ({current_pct}%)...")
+        
+        # อัปเดตข้อความแสดงผลแบบเรียลไทม์
+        status_text.markdown(f"""
+        🎧 **กำลังสังเคราะห์เสียงเปรมวดี...** ({current_pct}%)<br>
+        ⏱️ ทำงานไปแล้ว: **{elapsed_time:.1f} วินาที**<br>
+        ⚡ ความเร็ว: **{chars_per_sec:.1f} ตัวอักษร/วินาที**<br>
+        ⏳ จะเสร็จในอีกประมาณ: **{eta_seconds:.1f} วินาที** (เหลืออีก {remaining_chars:,} ตัวอักษร)
+        """, unsafe_allow_html=True)
         
         # สั่งรันพร้อมกันในกลุ่ม
-        tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
-        await asyncio.gather(*tasks)
+        batch_tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
+        await asyncio.gather(*batch_tasks)
         
         completed_count += len(batch_indices)
+        for idx in batch_indices:
+            processed_chars += len(text_chunks[idx])
 
     # รวมไฟล์ MP3 ย่อยทั้งหมดเข้าด้วยกัน
     status_text.text("🔗 กำลังรวมไฟล์เสียงทั้งหมดเข้าด้วยกัน...")
@@ -190,13 +209,14 @@ async def generate_audio_chunks_fast(text_content, voice, output_filename, progr
             if os.path.exists(f):
                 with open(f, "rb") as infile:
                     outfile.write(infile.read())
-                os.remove(f) # ลบไฟล์ย่อยทิ้งหลังรวมเสร็จ
+                os.remove(f)
 
+    total_duration = time.time() - start_time
     progress_bar.progress(100)
-    status_text.text("🎉 สร้างไฟล์เสียงสำเร็จ 100%!")
+    status_text.success(f"🎉 สร้างไฟล์เสียงสำเร็จ 100%! (ใช้เวลาทั้งหมด {total_duration:.1f}วินาที)")
     return True
 
-st.subheader("🎙️ สร้างเสียงเปรมวดี (เร่งความเร็ว + เปอร์เซ็นต์จริง)")
+st.subheader("🎙️ สร้างเสียงเปรมวดี (พร้อมระบบจับเวลา & คาดการณ์เวลาเสร็จ)")
 if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (MP3)"):
     if st.session_state.novel_text.strip() == "":
         st.warning("⚠️ กรุณามีข้อความสำหรับสร้างเสียงก่อนครับ")
@@ -207,8 +227,7 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
         try:
             output_file = "premwadee_final_translated.mp3"
             
-            # รันฟังก์ชันสร้างเสียงแบบกลุ่มคู่ขนานผ่าน asyncio
-            success = asyncio.run(generate_audio_chunks_fast(
+            success = asyncio.run(generate_audio_chunks_with_eta(
                 st.session_state.novel_text, 
                 "th-TH-PremwadeeNeural", 
                 output_file, 
@@ -220,7 +239,6 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
                 with open(output_file, "rb") as f:
                     audio_bytes = f.read()
                 
-                audio_status.success("🎉 สร้างเสียงเปรมวดีจากข้อความแปลไทยสำเร็จเรียบร้อย!")
                 st.audio(audio_bytes, format="audio/mp3")
                 
                 st.download_button(
