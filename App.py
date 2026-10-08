@@ -1,20 +1,41 @@
-# ============================================================
-# NOVEL AUDIO FACTORY
-# One-click Thai Novel -> MP3
-# Microsoft Edge TTS - Premwadee
-# ============================================================
+# NOVEL AUDIO FACTORY V6
+# Streamlit app for crawling novel chapters -> Thai translation -> Edge TTS -> batch MP3 + ZIP
+#
+# V6 improvements:
+# - Live progress / current set progress
+# - Elapsed time and dynamic ETA in seconds + readable format
+# - Overall progress
+# - Background worker so Streamlit UI can keep polling progress
+# - Separate bounded concurrency for fetch/translation/TTS stages
+# - Thread-safe checkpoint/progress writes
+# - Retry with backoff
+# - MP3 validation + self-healing
+# - Batch-by-batch automatic continuation
+# - Resume after refresh/restart
+# - No artificial fixed delay between successful jobs
+#
+# Requirements:
+#   pip install streamlit requests beautifulsoup4 edge-tts
+#   ffmpeg must be installed and available in PATH
+#
+# Run:
+#   streamlit run novel_audio_factory_v6.py
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
-import urllib.parse
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 import streamlit as st
@@ -26,413 +47,344 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_TITLE = "🎙️ โรงงานผลิตนิยายเสียง"
-
+APP_VERSION = "V6"
 VOICE = "th-TH-PremwadeeNeural"
 
-OUTPUT_DIR = "novel_output"
+BASE_DIR = Path("novel_audio_jobs")
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ระบบเลือกค่าเหล่านี้เอง
-EPISODE_WORKERS = 3
-TRANSLATE_WORKERS = 3
+FETCH_WORKERS = 6
+TRANSLATE_WORKERS = 4
 TTS_WORKERS = 6
 
-TRANSLATE_CHARS = 3500
-TTS_CHARS = 3000
+MAX_RETRIES = 4
+REQUEST_TIMEOUT = 25
+TRANSLATE_TIMEOUT = 45
 
-REQUEST_TIMEOUT = 35
+MIN_TEXT_CHARS = 80
+MIN_MP3_BYTES = 1500
 
-MAX_RETRY = 6
+# Google Translate unofficial endpoint. It may change/rate-limit.
+TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
-RETRY_WAIT = [2, 5, 10, 20, 40, 60]
-
-HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 10) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/130.0 Mobile Safari/537.36"
-    ),
-    "Accept-Language": "th,en;q=0.9",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36"
+)
 
 
 # ============================================================
-# BASIC
+# GLOBAL STATE
 # ============================================================
 
-def timestamp():
-    return datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+JOB_THREADS = {}
+JOB_THREADS_LOCK = threading.Lock()
+
+CHECKPOINT_LOCKS = {}
+CHECKPOINT_LOCKS_LOCK = threading.Lock()
 
 
-def wait_retry(n):
-    time.sleep(
-        RETRY_WAIT[
-            min(n - 1, len(RETRY_WAIT) - 1)
-        ]
-    )
+def get_job_lock(job_id: str) -> threading.Lock:
+    with CHECKPOINT_LOCKS_LOCK:
+        if job_id not in CHECKPOINT_LOCKS:
+            CHECKPOINT_LOCKS[job_id] = threading.Lock()
+        return CHECKPOINT_LOCKS[job_id]
 
 
-def safe_name(text):
-    text = re.sub(
-        r'[\\/:*?"<>|]+',
-        "_",
-        text,
-    )
+# ============================================================
+# BASIC HELPERS
+# ============================================================
 
-    text = re.sub(
-        r"\s+",
-        "_",
-        text,
-    )
-
-    return text[:150]
+def now_ts() -> float:
+    return time.time()
 
 
-def atomic_json_save(path, data):
-    tmp = path + ".tmp"
+def format_duration(seconds) -> str:
+    if seconds is None:
+        return "--:--"
 
-    with open(
-        tmp,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    try:
+        seconds = max(0, int(seconds))
+    except Exception:
+        return "--:--"
 
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def format_seconds_exact(seconds) -> str:
+    if seconds is None:
+        return "กำลังคำนวณ..."
+    return f"{max(0, int(seconds)):,} วินาที"
+
+
+def safe_filename(name: str, max_len: int = 90) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name or "")
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:max_len] or "novel"
+
+
+def atomic_write_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
-def load_json(path):
-    if not os.path.exists(path):
-        return None
-
+def read_json(path: Path, default=None):
     try:
-        with open(
-            path,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return None
+        return default
+
+
+def update_state(job_id: str, updater):
+    path = job_dir(job_id) / "state.json"
+    lock = get_job_lock(job_id)
+
+    with lock:
+        state = read_json(path, {}) or {}
+        updater(state)
+        atomic_write_json(path, state)
+        return state
+
+
+def read_state(job_id: str) -> dict:
+    return read_json(job_dir(job_id) / "state.json", {}) or {}
+
+
+def job_id_from_inputs(url: str, start: int, end: int, per_set: int) -> str:
+    raw = f"{url.strip()}|{start}|{end}|{per_set}|{VOICE}|{APP_VERSION}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def job_dir(job_id: str) -> Path:
+    p = BASE_DIR / job_id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def cache_dir(job_id: str, name: str) -> Path:
+    p = job_dir(job_id) / name
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 # ============================================================
-# TEXT
+# JOB STATE
 # ============================================================
 
-def clean_text(text):
-    if not text:
-        return ""
+def initial_state(url: str, start: int, end: int, per_set: int) -> dict:
+    total = end - start + 1
+    sets = (total + per_set - 1) // per_set
 
-    text = text.replace("\xa0", " ")
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
-    text = text.replace("\u200b", "")
-    text = text.replace("\ufeff", "")
+    return {
+        "version": APP_VERSION,
+        "url": url,
+        "start_episode": start,
+        "end_episode": end,
+        "episodes_per_set": per_set,
+        "total_episodes": total,
+        "total_sets": sets,
 
-    text = re.sub(
-        r"[ \t]+",
-        " ",
-        text,
-    )
+        "status": "idle",
+        "stage": "waiting",
+        "message": "พร้อมเริ่มงาน",
 
-    text = re.sub(
-        r"\n[ \t]+",
-        "\n",
-        text,
-    )
+        "current_set": 0,
+        "current_set_start": None,
+        "current_set_end": None,
+        "current_set_total": 0,
+        "current_set_completed": 0,
+        "current_set_started_at": None,
+        "current_set_finished_at": None,
+        "current_set_active_seconds": 0,
+        "current_set_eta_seconds": None,
 
-    text = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        text,
-    )
+        "overall_completed": 0,
+        "overall_failed": 0,
 
-    return text.strip()
+        "episode_status": {},
+        "episode_titles": {},
+        "episode_urls": {},
+
+        "set_outputs": {},
+
+        "job_started_at": None,
+        "job_finished_at": None,
+        "last_activity_at": None,
+
+        "error": None,
+    }
 
 
-def split_text(text, limit):
-    text = clean_text(text)
-
-    if not text:
-        return []
-
-    if len(text) <= limit:
-        return [text]
-
-    paragraphs = text.split("\n")
-
-    result = []
-    current = ""
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-
-        if not paragraph:
-            continue
-
-        candidate = (
-            paragraph
-            if not current
-            else current + "\n" + paragraph
-        )
-
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-
-        if current:
-            result.append(current)
-            current = ""
-
-        while len(paragraph) > limit:
-
-            cut_positions = [
-                paragraph.rfind("。", 0, limit),
-                paragraph.rfind("！", 0, limit),
-                paragraph.rfind("？", 0, limit),
-                paragraph.rfind(".", 0, limit),
-                paragraph.rfind("!", 0, limit),
-                paragraph.rfind("?", 0, limit),
-                paragraph.rfind(" ", 0, limit),
-            ]
-
-            cut = max(cut_positions)
-
-            if cut < limit // 2:
-                cut = limit
-
-            result.append(
-                paragraph[:cut].strip()
-            )
-
-            paragraph = paragraph[cut:].strip()
-
-        current = paragraph
-
-    if current:
-        result.append(current)
-
-    return [
-        x for x in result
-        if x.strip()
-    ]
+def ensure_state(job_id: str, url: str, start: int, end: int, per_set: int):
+    path = job_dir(job_id) / "state.json"
+    if not path.exists():
+        atomic_write_json(path, initial_state(url, start, end, per_set))
 
 
 # ============================================================
-# HTTP
+# HTTP / FETCH
 # ============================================================
 
-def download_page(url):
+_thread_local = threading.local()
+
+
+def get_session() -> requests.Session:
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
+            "Connection": "keep-alive",
+        })
+        _thread_local.session = session
+    return session
+
+
+def fetch_html(url: str) -> str:
+    session = get_session()
     last_error = None
 
-    for attempt in range(
-        1,
-        MAX_RETRY + 1,
-    ):
+    for attempt in range(MAX_RETRIES):
         try:
-            response = requests.get(
-                url,
-                headers=HTTP_HEADERS,
-                timeout=REQUEST_TIMEOUT,
-            )
+            r = session.get(url, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
 
-            response.raise_for_status()
+            # requests often detects charset, but some novel sites don't declare it.
+            r.encoding = r.apparent_encoding or r.encoding
+            text = r.text
 
-            if not response.text.strip():
-                raise RuntimeError(
-                    "หน้าเว็บว่าง"
-                )
+            if len(text) < 200:
+                raise RuntimeError("หน้าเว็บสั้นผิดปกติ")
 
-            return response.text
+            return text
 
         except Exception as e:
-            last_error = str(e)
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(min(2 ** attempt, 5))
 
-            if attempt < MAX_RETRY:
-                wait_retry(attempt)
-
-    raise RuntimeError(
-        "ดาวน์โหลดหน้าเว็บไม่ได้: "
-        + str(last_error)
-    )
+    raise RuntimeError(f"โหลดหน้าเว็บไม่สำเร็จ: {last_error}")
 
 
-# ============================================================
-# HTML PARSER
-# ============================================================
+def clean_text(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\r\n?", "\n", text)
+    lines = []
 
-def extract_novel_text(html):
-    soup = BeautifulSoup(
-        html,
-        "html.parser",
-    )
+    for line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
 
-    for tag in soup([
-        "script",
-        "style",
-        "noscript",
-        "nav",
-        "header",
-        "footer",
-        "aside",
-        "form",
-        "iframe",
-        "svg",
-    ]):
+    return "\n".join(lines)
+
+
+def extract_novel_text(html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "svg", "form"]):
         tag.decompose()
 
-    paragraphs = []
+    title = ""
+    if soup.title:
+        title = soup.title.get_text(" ", strip=True)
 
-    for p in soup.find_all("p"):
-        text = clean_text(
-            p.get_text(
-                " ",
-                strip=True,
-            )
-        )
-
-        if len(text) >= 10:
-            paragraphs.append(text)
-
-    if paragraphs:
-        return "\n\n".join(
-            paragraphs
-        )
-
-    body = soup.body
-
-    if body:
-        return clean_text(
-            body.get_text(
-                "\n",
-                strip=True,
-            )
-        )
-
-    return ""
-
-
-def find_next_url(current_url, html):
-    soup = BeautifulSoup(
-        html,
-        "html.parser",
-    )
-
-    # ----------------------------------------
-    # rel=next
-    # ----------------------------------------
-
-    for link in soup.find_all("a"):
-        rel = link.get("rel")
-
-        if not rel:
-            continue
-
-        rel_text = " ".join(
-            rel
-        ).lower()
-
-        if "next" in rel_text:
-            href = link.get("href")
-
-            if href:
-                return urllib.parse.urljoin(
-                    current_url,
-                    href,
-                )
-
-    # ----------------------------------------
-    # Next button
-    # ----------------------------------------
+    # Prefer common article/content containers.
+    selectors = [
+        "article",
+        "[class*='chapter-content']",
+        "[class*='chapter_content']",
+        "[class*='chapter-body']",
+        "[class*='chapter_body']",
+        "[class*='entry-content']",
+        "[class*='post-content']",
+        "[class*='novel-content']",
+        "[id*='chapter-content']",
+        "[id*='chapter_content']",
+        "[id*='chapter-body']",
+        "[id*='content']",
+        "main",
+    ]
 
     candidates = []
 
-    markers = [
-        "next",
-        "next chapter",
-        "ต่อไป",
-        "ตอนต่อไป",
-        "ถัดไป",
-        "下一章",
-        "下一页",
-        "下一頁",
-    ]
+    for selector in selectors:
+        for node in soup.select(selector):
+            ps = node.find_all("p")
+            if ps:
+                txt = "\n".join(p.get_text(" ", strip=True) for p in ps)
+            else:
+                txt = node.get_text("\n", strip=True)
 
-    for link in soup.find_all("a"):
-        href = link.get("href")
+            txt = clean_text(txt)
 
-        if not href:
-            continue
-
-        text = clean_text(
-            link.get_text(
-                " ",
-                strip=True,
-            )
-        ).lower()
-
-        score = 0
-
-        for marker in markers:
-            if marker in text:
-                score += 10
-
-        if text in (
-            "next",
-            "next chapter",
-            "ต่อไป",
-            "ตอนต่อไป",
-            "ถัดไป",
-        ):
-            score += 50
-
-        if score:
-            candidates.append(
-                (
-                    score,
-                    urllib.parse.urljoin(
-                        current_url,
-                        href,
-                    ),
-                )
-            )
+            if len(txt) >= MIN_TEXT_CHARS:
+                candidates.append(txt)
 
     if candidates:
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True,
-        )
+        text = max(candidates, key=len)
+    else:
+        ps = soup.find_all("p")
+        text = clean_text("\n".join(p.get_text(" ", strip=True) for p in ps))
 
-        return candidates[0][1]
+    # Remove obvious navigation-only pages.
+    if len(text) < MIN_TEXT_CHARS:
+        raise RuntimeError("ไม่พบเนื้อหานิยายที่เพียงพอ")
 
-    # ----------------------------------------
-    # Numeric URL fallback
-    # ----------------------------------------
+    return title, text
 
-    match = re.search(
-        r"(\d+)(?!.*\d)",
-        current_url,
-    )
 
-    if match:
-        number = int(
-            match.group(1)
-        ) + 1
+def find_next_url(current_url: str, html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
 
-        return (
-            current_url[:match.start(1)]
-            + str(number)
-            + current_url[match.end(1):]
-        )
+    # Standard rel=next first.
+    for link in soup.find_all("a", href=True):
+        rel = link.get("rel") or []
+        rel = [str(x).lower() for x in rel]
+        if "next" in rel:
+            return urljoin(current_url, link["href"])
+
+    # Text-based next buttons.
+    next_words = [
+        "next chapter",
+        "next",
+        "ตอนต่อไป",
+        "บทต่อไป",
+        "ตอนถัดไป",
+        "ถัดไป",
+    ]
+
+    for link in soup.find_all("a", href=True):
+        label = link.get_text(" ", strip=True).lower()
+        if any(word in label for word in next_words):
+            return urljoin(current_url, link["href"])
+
+    # Try numeric chapter URL increment.
+    parsed = urlparse(current_url)
+    path = parsed.path
+
+    m = re.search(r"(\d+)(?!.*\d)", path)
+    if m:
+        n = int(m.group(1))
+        next_path = path[:m.start(1)] + str(n + 1) + path[m.end(1):]
+        candidate = parsed._replace(path=next_path).geturl()
+        return candidate
 
     return None
 
@@ -441,12 +393,7 @@ def find_next_url(current_url, html):
 # TRANSLATION
 # ============================================================
 
-def translate_part(text):
-    endpoint = (
-        "https://translate.googleapis.com/"
-        "translate_a/single"
-    )
-
+def translate_chunk(text: str) -> str:
     params = {
         "client": "gtx",
         "sl": "auto",
@@ -455,1399 +402,1189 @@ def translate_part(text):
         "q": text,
     }
 
-    last_error = None
-
-    for attempt in range(
-        1,
-        MAX_RETRY + 1,
-    ):
-        try:
-            response = requests.get(
-                endpoint,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            result = ""
-
-            for item in data[0]:
-                if item and item[0]:
-                    result += item[0]
-
-            result = clean_text(result)
-
-            if not result:
-                raise RuntimeError(
-                    "ไม่ได้ข้อความแปล"
-                )
-
-            return result
-
-        except Exception as e:
-            last_error = str(e)
-
-            if attempt < MAX_RETRY:
-                wait_retry(attempt)
-
-    raise RuntimeError(
-        "Translation error: "
-        + str(last_error)
+    session = get_session()
+    r = session.get(
+        TRANSLATE_URL,
+        params=params,
+        timeout=TRANSLATE_TIMEOUT,
     )
+    r.raise_for_status()
+
+    data = r.json()
+    pieces = []
+
+    for item in data[0]:
+        if item and item[0]:
+            pieces.append(item[0])
+
+    result = "".join(pieces).strip()
+
+    if len(result) < 10:
+        raise RuntimeError("ผลแปลสั้นผิดปกติ")
+
+    return result
 
 
-async def translate_episode(text):
-    parts = split_text(
-        text,
-        TRANSLATE_CHARS,
-    )
+def split_for_translation(text: str, max_chars: int = 4500):
+    paragraphs = [x.strip() for x in text.split("\n") if x.strip()]
+    chunks = []
+    current = ""
 
-    if not parts:
-        return ""
+    for p in paragraphs:
+        if len(current) + len(p) + 1 <= max_chars:
+            current = f"{current}\n{p}".strip()
+        else:
+            if current:
+                chunks.append(current)
 
-    semaphore = asyncio.Semaphore(
-        TRANSLATE_WORKERS
-    )
+            # Long paragraph fallback.
+            if len(p) > max_chars:
+                for i in range(0, len(p), max_chars):
+                    chunks.append(p[i:i + max_chars])
+                current = ""
+            else:
+                current = p
 
-    loop = asyncio.get_running_loop()
+    if current:
+        chunks.append(current)
 
-    async def translate_worker(
-        index,
-        part,
-    ):
-        async with semaphore:
+    return chunks
 
-            result = await loop.run_in_executor(
-                None,
-                translate_part,
-                part,
-            )
 
-            return index, result
+def translate_text(text: str) -> str:
+    chunks = split_for_translation(text)
+    out = []
 
-    jobs = [
-        translate_worker(
-            i,
-            part,
-        )
-        for i, part in enumerate(parts)
-    ]
+    for chunk in chunks:
+        last_error = None
 
-    results = await asyncio.gather(
-        *jobs
-    )
+        for attempt in range(MAX_RETRIES):
+            try:
+                out.append(translate_chunk(chunk))
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    # Backoff only after a failure. No artificial delay on success.
+                    time.sleep(min(1.5 * (2 ** attempt), 8))
+        else:
+            raise RuntimeError(f"แปลไม่สำเร็จ: {last_error}")
 
-    results.sort(
-        key=lambda x: x[0]
-    )
-
-    return "\n\n".join(
-        x[1]
-        for x in results
-    )
+    return "\n".join(out)
 
 
 # ============================================================
 # TTS
 # ============================================================
 
-async def create_tts_file(
-    text,
-    output,
-):
-    last_error = None
+def run_tts_sync(text: str, output_path: Path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for attempt in range(
-        1,
-        MAX_RETRY + 1,
-    ):
-        try:
+    async def _run():
+        communicate = edge_tts.Communicate(text, VOICE)
+        await communicate.save(str(output_path))
 
-            communicate = edge_tts.Communicate(
-                text,
-                VOICE,
-            )
-
-            await communicate.save(
-                output
-            )
-
-            if (
-                os.path.exists(output)
-                and os.path.getsize(output) > 1000
-            ):
-                return True
-
-            raise RuntimeError(
-                "ไฟล์เสียงผิดปกติ"
-            )
-
-        except Exception as e:
-            last_error = str(e)
-
-            try:
-                if os.path.exists(output):
-                    os.remove(output)
-            except Exception:
-                pass
-
-            if attempt < MAX_RETRY:
-                await asyncio.sleep(
-                    RETRY_WAIT[
-                        min(
-                            attempt - 1,
-                            len(RETRY_WAIT) - 1,
-                        )
-                    ]
-                )
-
-    raise RuntimeError(
-        "TTS error: "
-        + str(last_error)
-    )
+    asyncio.run(_run())
 
 
-async def create_episode_tts(
-    text,
-    output,
-):
-    parts = split_text(
-        text,
-        TTS_CHARS,
-    )
-
-    if not parts:
-        raise RuntimeError(
-            "ไม่มีข้อความสำหรับ TTS"
-        )
-
-    # ----------------------------------------
-    # ตอนสั้น
-    # ----------------------------------------
-
-    if len(parts) == 1:
-        await create_tts_file(
-            parts[0],
-            output,
-        )
-        return
-
-    # ----------------------------------------
-    # ตอนยาว
-    # ----------------------------------------
-
-    temp_dir = tempfile.mkdtemp(
-        prefix="tts_"
-    )
-
-    try:
-
-        semaphore = asyncio.Semaphore(
-            TTS_WORKERS
-        )
-
-        async def worker(
-            index,
-            part,
-        ):
-            filename = os.path.join(
-                temp_dir,
-                f"{index:05d}.mp3",
-            )
-
-            async with semaphore:
-
-                await create_tts_file(
-                    part,
-                    filename,
-                )
-
-            return index, filename
-
-        jobs = [
-            worker(
-                i,
-                part,
-            )
-            for i, part in enumerate(parts)
-        ]
-
-        results = await asyncio.gather(
-            *jobs
-        )
-
-        results.sort(
-            key=lambda x: x[0]
-        )
-
-        merge_mp3(
-            [
-                x[1]
-                for x in results
-            ],
-            output,
-        )
-
-    finally:
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
-        )
-
-
-# ============================================================
-# FFMPEG
-# ============================================================
-
-def check_ffmpeg():
-    return shutil.which(
-        "ffmpeg"
-    ) is not None
-
-
-def merge_mp3(
-    files,
-    output,
-):
-    if not files:
-        raise RuntimeError(
-            "ไม่มี MP3 ให้รวม"
-        )
-
-    if len(files) == 1:
-        shutil.copyfile(
-            files[0],
-            output,
-        )
-        return
-
-    if not check_ffmpeg():
-        raise RuntimeError(
-            "ไม่พบ ffmpeg"
-        )
-
-    list_file = output + ".txt"
-    temp_output = output + ".tmp.mp3"
-
-    with open(
-        list_file,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        for path in files:
-
-            absolute = os.path.abspath(
-                path
-            )
-
-            absolute = absolute.replace(
-                "'",
-                "'\\''",
-            )
-
-            f.write(
-                "file '"
-                + absolute
-                + "'\n"
-            )
-
-    try:
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                list_file,
-                "-map",
-                "0:a:0",
-                "-c",
-                "copy",
-                temp_output,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-
-        os.replace(
-            temp_output,
-            output,
-        )
-
-    except Exception as e:
-
-        if os.path.exists(
-            temp_output
-        ):
-            os.remove(
-                temp_output
-            )
-
-        raise RuntimeError(
-            "รวม MP3 ไม่สำเร็จ: "
-            + str(e)
-        )
-
-    finally:
-
-        if os.path.exists(
-            list_file
-        ):
-            os.remove(
-                list_file
-            )
-
-
-# ============================================================
-# FILE VALIDATION
-# ============================================================
-
-def valid_mp3(path):
-    if not os.path.exists(path):
+def valid_mp3(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size < MIN_MP3_BYTES:
         return False
 
-    try:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return True
 
-        size = os.path.getsize(
-            path
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
 
-        if size < 1000:
+        if result.returncode != 0:
             return False
 
-        return True
+        duration = float(result.stdout.strip() or "0")
+        return duration > 0.05
 
     except Exception:
         return False
 
 
 # ============================================================
-# EPISODE CACHE
+# CACHE
 # ============================================================
 
-def episode_paths(
-    job_dir,
-    episode,
-):
-    directory = os.path.join(
-        job_dir,
-        "episodes",
-        f"{episode:05d}",
-    )
-
-    os.makedirs(
-        directory,
-        exist_ok=True,
-    )
-
+def episode_paths(job_id: str, episode: int):
+    root = job_dir(job_id)
     return {
-        "dir": directory,
-        "html": os.path.join(
-            directory,
-            "page.html",
-        ),
-        "original": os.path.join(
-            directory,
-            "original.txt",
-        ),
-        "thai": os.path.join(
-            directory,
-            "thai.txt",
-        ),
-        "mp3": os.path.join(
-            directory,
-            f"episode_{episode:05d}.mp3",
-        ),
+        "html": root / "html_cache" / f"{episode}.html",
+        "raw": root / "text_cache" / f"{episode}.txt",
+        "translated": root / "translated_cache" / f"{episode}.txt",
+        "mp3": root / "episode_mp3" / f"episode_{episode:06d}.mp3",
     }
 
 
-# ============================================================
-# PROCESS ONE EPISODE
-# ============================================================
-
-async def process_episode(
-    job_dir,
-    episode,
-    url,
-):
-    paths = episode_paths(
-        job_dir,
-        episode,
-    )
-
-    # ----------------------------------------
-    # HTML
-    # ----------------------------------------
-
-    if os.path.exists(
-        paths["html"]
-    ):
-
-        with open(
-            paths["html"],
-            "r",
-            encoding="utf-8",
-        ) as f:
-            html = f.read()
-
-    else:
-
-        loop = asyncio.get_running_loop()
-
-        html = await loop.run_in_executor(
-            None,
-            download_page,
-            url,
-        )
-
-        with open(
-            paths["html"],
-            "w",
-            encoding="utf-8",
-        ) as f:
-            f.write(html)
-
-    # ----------------------------------------
-    # ORIGINAL
-    # ----------------------------------------
-
-    if os.path.exists(
-        paths["original"]
-    ):
-
-        with open(
-            paths["original"],
-            "r",
-            encoding="utf-8",
-        ) as f:
-            original = f.read()
-
-    else:
-
-        original = extract_novel_text(
-            html
-        )
-
-        if not original:
-            raise RuntimeError(
-                f"ตอน {episode} "
-                "ไม่พบข้อความนิยาย"
-            )
-
-        with open(
-            paths["original"],
-            "w",
-            encoding="utf-8",
-        ) as f:
-            f.write(original)
-
-    # ----------------------------------------
-    # TRANSLATION
-    # ----------------------------------------
-
-    if os.path.exists(
-        paths["thai"]
-    ):
-
-        with open(
-            paths["thai"],
-            "r",
-            encoding="utf-8",
-        ) as f:
-            thai = f.read()
-
-    else:
-
-        thai = await translate_episode(
-            original
-        )
-
-        if not thai:
-            raise RuntimeError(
-                "แปลไม่ได้"
-            )
-
-        with open(
-            paths["thai"],
-            "w",
-            encoding="utf-8",
-        ) as f:
-            f.write(thai)
-
-    # ----------------------------------------
-    # TTS
-    # ----------------------------------------
-
-    if not valid_mp3(
-        paths["mp3"]
-    ):
-
-        await create_episode_tts(
-            thai,
-            paths["mp3"],
-        )
-
-    if not valid_mp3(
-        paths["mp3"]
-    ):
-        raise RuntimeError(
-            "สร้าง MP3 แล้วแต่ไฟล์เสีย"
-        )
-
-    return {
-        "episode": episode,
-        "url": url,
-        "mp3": paths["mp3"],
-        "status": "done",
-    }
+def load_cached_text(path: Path) -> Optional[str]:
+    try:
+        if path.exists() and path.stat().st_size > 10:
+            return path.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
-# DISCOVER ALL EPISODE URLS
+# EPISODE URL DISCOVERY
 # ============================================================
 
-def discover_urls(
-    start_url,
-    start_episode,
-    end_episode,
-    job_dir,
-    checkpoint,
-):
-    urls = {}
+def discover_episode_urls(job_id: str, start_url: str, start_episode: int, end_episode: int):
+    """
+    Crawl sequentially from the starting URL.
+    The crawler stores URLs by episode number.
+    It stops when it has discovered the requested final episode,
+    or when the site no longer exposes a next URL.
+    """
+
+    state = read_state(job_id)
+    known = state.get("episode_urls", {})
+
+    if str(start_episode) in known and len(known) >= (end_episode - start_episode + 1):
+        return known
 
     current_url = start_url
+    current_episode = start_episode
+    visited = set()
 
-    for episode in range(
-        start_episode,
-        end_episode + 1,
-    ):
-
-        # checkpoint มี URL อยู่แล้ว
-        saved = checkpoint.get(
-            "urls",
-            {},
-        ).get(
-            str(episode)
+    # If checkpoint has the last known URL, start from the first missing episode.
+    if known:
+        existing_eps = sorted(
+            int(k) for k in known.keys()
+            if str(k).isdigit()
         )
 
-        if saved:
-            current_url = saved
+        if existing_eps:
+            last_ep = max(existing_eps)
+            if last_ep >= start_episode:
+                current_episode = last_ep + 1
+                prev_url = known.get(str(last_ep))
+                if prev_url:
+                    try:
+                        prev_html = fetch_html(prev_url)
+                        nxt = find_next_url(prev_url, prev_html)
+                        if nxt:
+                            current_url = nxt
+                    except Exception:
+                        pass
 
-        urls[episode] = current_url
-
-        # ไม่ต้องหา next หลังตอนสุดท้าย
-        if episode == end_episode:
+    while current_episode <= end_episode and current_url:
+        if current_url in visited:
             break
 
-        cache = episode_paths(
-            job_dir,
-            episode,
-        )
+        visited.add(current_url)
+        ep_key = str(current_episode)
 
-        # ใช้ HTML cache ถ้ามี
-        if os.path.exists(
-            cache["html"]
-        ):
+        if ep_key not in known:
+            known[ep_key] = current_url
 
-            with open(
-                cache["html"],
-                "r",
-                encoding="utf-8",
-            ) as f:
-                html = f.read()
+            def upd(s):
+                s["episode_urls"] = known
+                s["last_activity_at"] = now_ts()
+                s["stage"] = "crawling"
+                s["message"] = f"พบ URL ตอนที่ {current_episode}"
 
-        else:
+            update_state(job_id, upd)
 
-            html = download_page(
-                current_url
-            )
+        try:
+            html = fetch_html(current_url)
+            next_url = find_next_url(current_url, html)
+        except Exception:
+            next_url = None
 
-            with open(
-                cache["html"],
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(html)
-
-        next_url = find_next_url(
-            current_url,
-            html,
-        )
-
-        if not next_url:
-            raise RuntimeError(
-                f"หา URL ตอน {episode + 1} ไม่ได้"
-            )
-
+        current_episode += 1
         current_url = next_url
 
-        checkpoint.setdefault(
-            "urls",
-            {},
-        )[str(episode + 1)] = current_url
+    return known
 
-        atomic_json_save(
-            checkpoint["_file"],
-            checkpoint,
-        )
 
-    return urls
+# ============================================================
+# EPISODE PROCESS
+# ============================================================
+
+def set_episode_status(job_id: str, episode: int, status: str, **extra):
+    def upd(s):
+        es = s.setdefault("episode_status", {})
+        item = es.setdefault(str(episode), {})
+        item["status"] = status
+        item["updated_at"] = now_ts()
+        item.update(extra)
+        s["last_activity_at"] = now_ts()
+
+    update_state(job_id, upd)
+
+
+def process_episode(job_id: str, episode: int, url: str, fetch_pool, translate_pool, tts_pool):
+    paths = episode_paths(job_id, episode)
+
+    # ---------------- FETCH / EXTRACT ----------------
+    set_episode_status(job_id, episode, "fetching")
+
+    try:
+        if paths["raw"].exists():
+            raw_text = load_cached_text(paths["raw"])
+            title = read_state(job_id).get("episode_titles", {}).get(str(episode), "")
+            if not raw_text:
+                raise RuntimeError("cache ข้อความเสีย")
+        else:
+            html = fetch_html(url)
+            paths["html"].parent.mkdir(parents=True, exist_ok=True)
+            paths["html"].write_text(html, encoding="utf-8")
+
+            title, raw_text = extract_novel_text(html)
+            paths["raw"].parent.mkdir(parents=True, exist_ok=True)
+            paths["raw"].write_text(raw_text, encoding="utf-8")
+
+            def upd_title(s):
+                s.setdefault("episode_titles", {})[str(episode)] = title
+
+            update_state(job_id, upd_title)
+
+        if len(raw_text) < MIN_TEXT_CHARS:
+            raise RuntimeError("เนื้อหาตอนสั้นผิดปกติ")
+
+    except Exception as e:
+        set_episode_status(job_id, episode, "failed", error=f"FETCH: {e}")
+        raise
+
+    # ---------------- TRANSLATE ----------------
+    set_episode_status(job_id, episode, "translating")
+
+    try:
+        translated = load_cached_text(paths["translated"])
+
+        if not translated:
+            translated = translate_text(raw_text)
+            paths["translated"].parent.mkdir(parents=True, exist_ok=True)
+            paths["translated"].write_text(translated, encoding="utf-8")
+
+        if len(translated) < 10:
+            raise RuntimeError("ข้อความแปลว่าง/สั้นเกินไป")
+
+    except Exception as e:
+        set_episode_status(job_id, episode, "failed", error=f"TRANSLATE: {e}")
+        raise
+
+    # ---------------- TTS ----------------
+    set_episode_status(job_id, episode, "tts")
+
+    try:
+        if not valid_mp3(paths["mp3"]):
+            if paths["mp3"].exists():
+                try:
+                    paths["mp3"].unlink()
+                except Exception:
+                    pass
+
+            run_tts_sync(translated, paths["mp3"])
+
+        if not valid_mp3(paths["mp3"]):
+            raise RuntimeError("MP3 ตรวจสอบแล้วไม่ผ่าน")
+
+    except Exception as e:
+        set_episode_status(job_id, episode, "failed", error=f"TTS: {e}")
+        raise
+
+    set_episode_status(
+        job_id,
+        episode,
+        "done",
+        mp3=str(paths["mp3"]),
+        finished_at=now_ts(),
+    )
+
+    return True
 
 
 # ============================================================
 # SELF HEAL
 # ============================================================
 
-async def self_heal_episode(
-    job_dir,
-    episode,
-    url,
-    status_callback=None,
-):
+def process_episode_with_retry(job_id: str, episode: int, url: str, fetch_pool, translate_pool, tts_pool):
     last_error = None
 
-    for attempt in range(
-        1,
-        MAX_RETRY + 1,
-    ):
-
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-
-            if status_callback:
-                status_callback(
-                    episode,
-                    f"กำลังซ่อม/ลองใหม่ "
-                    f"{attempt}/{MAX_RETRY}",
-                )
-
-            result = await process_episode(
-                job_dir,
+            return process_episode(
+                job_id,
                 episode,
                 url,
+                fetch_pool,
+                translate_pool,
+                tts_pool,
             )
-
-            return result
-
         except Exception as e:
+            last_error = e
 
-            last_error = str(e)
-
-            # ------------------------------------
-            # ล้างเฉพาะไฟล์ที่อาจเสีย
-            # ------------------------------------
-
-            paths = episode_paths(
-                job_dir,
+            set_episode_status(
+                job_id,
                 episode,
+                "retrying",
+                attempt=attempt,
+                error=str(e),
             )
 
-            if "TTS" in str(e):
-                try:
-                    if os.path.exists(
-                        paths["mp3"]
-                    ):
-                        os.remove(
-                            paths["mp3"]
-                        )
-                except Exception:
-                    pass
+            if attempt < MAX_RETRIES:
+                # Backoff only after an actual failure.
+                time.sleep(min(2 ** (attempt - 1), 8))
 
-            if "แปล" in str(e):
-                try:
-                    if os.path.exists(
-                        paths["thai"]
-                    ):
-                        os.remove(
-                            paths["thai"]
-                        )
-                except Exception:
-                    pass
-
-            if attempt < MAX_RETRY:
-
-                await asyncio.sleep(
-                    RETRY_WAIT[
-                        min(
-                            attempt - 1,
-                            len(RETRY_WAIT) - 1,
-                        )
-                    ]
-                )
-
-    raise RuntimeError(
-        f"ตอน {episode} ล้มเหลวหลัง "
-        f"{MAX_RETRY} ครั้ง: "
-        f"{last_error}"
+    set_episode_status(
+        job_id,
+        episode,
+        "failed",
+        attempts=MAX_RETRIES,
+        error=str(last_error),
     )
+    return False
 
 
 # ============================================================
-# CREATE ONE BATCH
+# FFMPEG BATCH BUILD
 # ============================================================
 
-async def process_batch(
-    job_dir,
-    batch_number,
-    episodes,
-    urls,
-    checkpoint,
-    status_callback=None,
-):
-    results = {}
+def merge_mp3s(mp3_paths: list[Path], output: Path):
+    if not mp3_paths:
+        raise RuntimeError("ไม่มี MP3 ให้รวม")
 
-    # ----------------------------------------
-    # ทำหลายตอนพร้อมกันแบบจำกัด
-    # ----------------------------------------
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ไม่พบ ffmpeg ใน PATH")
 
-    semaphore = asyncio.Semaphore(
-        EPISODE_WORKERS
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    async def worker(
-        episode
-    ):
-        async with semaphore:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        delete=False,
+        encoding="utf-8",
+    ) as f:
+        concat_file = Path(f.name)
 
-            result = await self_heal_episode(
-                job_dir,
-                episode,
-                urls[episode],
-                status_callback,
-            )
+        for p in mp3_paths:
+            safe = str(p.resolve()).replace("'", "'\\''")
+            f.write(f"file '{safe}'\n")
 
-            results[
-                episode
-            ] = result
-
-    await asyncio.gather(
-        *[
-            worker(ep)
-            for ep in episodes
+    try:
+        cmd_copy = [
+            ffmpeg,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_file),
+            "-c", "copy",
+            str(output),
         ]
-    )
 
-    # ----------------------------------------
-    # เรียงตอน
-    # ----------------------------------------
-
-    ordered = [
-        results[ep]
-        for ep in sorted(results)
-    ]
-
-    # ----------------------------------------
-    # รวม MP3
-    # ----------------------------------------
-
-    batch_dir = os.path.join(
-        job_dir,
-        "batches",
-    )
-
-    os.makedirs(
-        batch_dir,
-        exist_ok=True,
-    )
-
-    first_ep = min(episodes)
-    last_ep = max(episodes)
-
-    output = os.path.join(
-        batch_dir,
-        f"ชุด_{batch_number:03d}_"
-        f"ตอน_{first_ep}-{last_ep}.mp3",
-    )
-
-    if not valid_mp3(output):
-
-        merge_mp3(
-            [
-                x["mp3"]
-                for x in ordered
-            ],
-            output,
+        r = subprocess.run(
+            cmd_copy,
+            capture_output=True,
+            text=True,
+            timeout=3600,
         )
 
-    if not valid_mp3(output):
-        raise RuntimeError(
-            f"รวมชุด {batch_number} "
-            "ไม่สำเร็จ"
+        if r.returncode == 0 and valid_mp3(output):
+            return
+
+        # Fallback: re-encode if source MP3s have incompatible streams.
+        cmd_reencode = [
+            ffmpeg,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_file),
+            "-vn",
+            "-c:a", "libmp3lame",
+            "-b:a", "128k",
+            str(output),
+        ]
+
+        r2 = subprocess.run(
+            cmd_reencode,
+            capture_output=True,
+            text=True,
+            timeout=3600,
         )
 
-    # ----------------------------------------
-    # Checkpoint
-    # ----------------------------------------
+        if r2.returncode != 0 or not valid_mp3(output):
+            raise RuntimeError(
+                "รวม MP3 ไม่สำเร็จ\n"
+                + (r2.stderr[-1500:] if r2.stderr else "")
+            )
 
-    checkpoint.setdefault(
-        "batches",
-        {},
-    )[str(batch_number)] = {
-        "first_episode": first_ep,
-        "last_episode": last_ep,
-        "file": output,
-        "status": "done",
-        "updated": timestamp(),
-    }
+    finally:
+        try:
+            concat_file.unlink()
+        except Exception:
+            pass
 
-    for ep in episodes:
 
-        checkpoint.setdefault(
-            "episodes",
-            {},
-        )[str(ep)] = {
-            "status": "done",
-            "mp3": results[ep]["mp3"],
+def zip_file(input_file: Path, output_zip: Path):
+    output_zip.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(
+        output_zip,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as z:
+        z.write(input_file, arcname=input_file.name)
+
+
+# ============================================================
+# PROGRESS / ETA
+# ============================================================
+
+def calculate_batch_metrics(state: dict):
+    total = int(state.get("current_set_total") or 0)
+    done = int(state.get("current_set_completed") or 0)
+    started = state.get("current_set_started_at")
+
+    if not started:
+        return {
+            "elapsed": 0,
+            "eta": None,
+            "rate": 0,
+            "percent": 0,
         }
 
-    atomic_json_save(
-        checkpoint["_file"],
-        checkpoint,
-    )
+    finished_time = state.get("current_set_finished_at") or now_ts()
+    elapsed = max(0, finished_time - started)
 
-    return output
+    if total:
+        percent = min(100, (done / total) * 100)
+    else:
+        percent = 0
 
-
-# ============================================================
-# COMPLETE JOB
-# ============================================================
-
-async def run_job(
-    start_url,
-    start_episode,
-    end_episode,
-    episodes_per_batch,
-    progress_callback=None,
-    status_callback=None,
-):
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True,
-    )
-
-    # ----------------------------------------
-    # Job ID
-    # ----------------------------------------
-
-    job_id = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    job_dir = os.path.join(
-        OUTPUT_DIR,
-        "job_" + job_id,
-    )
-
-    os.makedirs(
-        job_dir,
-        exist_ok=True,
-    )
-
-    checkpoint_file = os.path.join(
-        job_dir,
-        "checkpoint.json",
-    )
-
-    checkpoint = {
-        "created": timestamp(),
-        "updated": timestamp(),
-        "start_url": start_url,
-        "start_episode": start_episode,
-        "end_episode": end_episode,
-        "episodes_per_batch":
-            episodes_per_batch,
-        "urls": {},
-        "episodes": {},
-        "batches": {},
-        "status": "running",
-        "_file": checkpoint_file,
-    }
-
-    atomic_json_save(
-        checkpoint_file,
-        checkpoint,
-    )
-
-    # ----------------------------------------
-    # Discover URL
-    # ----------------------------------------
-
-    if status_callback:
-        status_callback(
-            "กำลังค้นหา URL ของแต่ละตอน..."
-        )
-
-    urls = discover_urls(
-        start_url,
-        start_episode,
-        end_episode,
-        job_dir,
-        checkpoint,
-    )
-
-    # ----------------------------------------
-    # จำนวนชุด
-    # ----------------------------------------
-
-    all_episodes = list(
-        range(
-            start_episode,
-            end_episode + 1,
-        )
-    )
-
-    batches = []
-
-    for i in range(
-        0,
-        len(all_episodes),
-        episodes_per_batch,
-    ):
-        batches.append(
-            all_episodes[
-                i:i + episodes_per_batch
-            ]
-        )
-
-    total_batches = len(
-        batches
-    )
-
-    batch_files = []
-
-    # ----------------------------------------
-    # ทำทีละชุด
-    # ----------------------------------------
-
-    for batch_index, episodes in enumerate(
-        batches,
-        start=1,
-    ):
-
-        # ------------------------------------
-        # ถ้าชุดนี้เสร็จแล้ว
-        # ข้ามทันที
-        # ------------------------------------
-
-        saved_batch = checkpoint.get(
-            "batches",
-            {},
-        ).get(
-            str(batch_index)
-        )
-
-        if (
-            saved_batch
-            and saved_batch.get(
-                "status"
-            ) == "done"
-            and os.path.exists(
-                saved_batch.get(
-                    "file",
-                    "",
-                )
-            )
-        ):
-
-            batch_files.append(
-                saved_batch["file"]
-            )
-
-            if status_callback:
-                status_callback(
-                    f"ชุด {batch_index}/"
-                    f"{total_batches} "
-                    "มีอยู่แล้ว — ข้าม"
-                )
-
-            continue
-
-        if status_callback:
-            status_callback(
-                f"กำลังสร้างชุด "
-                f"{batch_index}/{total_batches} "
-                f"ตอน {episodes[0]}-"
-                f"{episodes[-1]}"
-            )
-
-        # ------------------------------------
-        # สร้างชุด
-        # ------------------------------------
-
-        batch_file = await process_batch(
-            job_dir,
-            batch_index,
-            episodes,
-            urls,
-            checkpoint,
-            status_callback,
-        )
-
-        batch_files.append(
-            batch_file
-        )
-
-        if progress_callback:
-            progress_callback(
-                batch_index,
-                total_batches,
-            )
-
-    # ----------------------------------------
-    # สร้าง ZIP รวมทุกชุด
-    # ----------------------------------------
-
-    zip_path = os.path.join(
-        job_dir,
-        "นิยายเสียง_ทั้งหมด.zip",
-    )
-
-    with __import__(
-        "zipfile"
-    ).ZipFile(
-        zip_path,
-        "w",
-        __import__(
-            "zipfile"
-        ).ZIP_DEFLATED,
-    ) as z:
-
-        for file in batch_files:
-
-            if os.path.exists(file):
-
-                z.write(
-                    file,
-                    arcname=os.path.basename(
-                        file
-                    ),
-                )
-
-    checkpoint["status"] = "complete"
-    checkpoint["completed"] = timestamp()
-    checkpoint["zip"] = zip_path
-
-    # ลบตัวช่วยภายในก่อนบันทึก
-    checkpoint.pop(
-        "_file",
-        None,
-    )
-
-    atomic_json_save(
-        checkpoint_file,
-        checkpoint,
-    )
+    if done > 0 and elapsed > 0 and done < total:
+        rate = done / elapsed
+        eta = (total - done) / rate
+    elif done >= total and total > 0:
+        rate = done / max(elapsed, 0.001)
+        eta = 0
+    else:
+        rate = 0
+        eta = None
 
     return {
-        "job_dir": job_dir,
-        "zip": zip_path,
-        "batches": batch_files,
-        "total_episodes":
-            len(all_episodes),
-        "total_batches":
-            total_batches,
+        "elapsed": elapsed,
+        "eta": eta,
+        "rate": rate,
+        "percent": percent,
     }
 
 
+def refresh_progress_for_batch(job_id: str, set_start: int, set_end: int):
+    state = read_state(job_id)
+    statuses = state.get("episode_status", {})
+
+    done = 0
+    failed = 0
+
+    for ep in range(set_start, set_end + 1):
+        status = statuses.get(str(ep), {}).get("status")
+        if status == "done":
+            done += 1
+        elif status == "failed":
+            failed += 1
+
+    started = state.get("current_set_started_at")
+    active = 0
+
+    if started:
+        active = now_ts() - started
+        if state.get("current_set_finished_at"):
+            active = state["current_set_finished_at"] - started
+
+    total = set_end - set_start + 1
+
+    if done > 0 and active > 0 and done < total:
+        eta = ((total - done) / done) * active
+    elif done >= total:
+        eta = 0
+    else:
+        eta = None
+
+    def upd(s):
+        s["current_set_completed"] = done
+        s["current_set_total"] = total
+        s["current_set_active_seconds"] = max(0, active)
+        s["current_set_eta_seconds"] = eta
+        s["overall_completed"] = sum(
+            1 for x in s.get("episode_status", {}).values()
+            if x.get("status") == "done"
+        )
+        s["overall_failed"] = sum(
+            1 for x in s.get("episode_status", {}).values()
+            if x.get("status") == "failed"
+        )
+        s["last_activity_at"] = now_ts()
+
+    return update_state(job_id, upd)
+
+
 # ============================================================
-# STREAMLIT
+# MAIN JOB
+# ============================================================
+
+def run_job(job_id: str):
+    state = read_state(job_id)
+
+    url = state["url"]
+    start = int(state["start_episode"])
+    end = int(state["end_episode"])
+    per_set = int(state["episodes_per_set"])
+
+    def start_job(s):
+        s["status"] = "running"
+        s["stage"] = "crawling"
+        s["job_started_at"] = s.get("job_started_at") or now_ts()
+        s["last_activity_at"] = now_ts()
+        s["error"] = None
+
+    update_state(job_id, start_job)
+
+    try:
+        # Discover all URLs first. This is separate from audio processing,
+        # and cached URLs allow later resumes to skip crawling work.
+        known_urls = discover_episode_urls(
+            job_id,
+            url,
+            start,
+            end,
+        )
+
+        missing = [
+            ep for ep in range(start, end + 1)
+            if str(ep) not in known_urls
+        ]
+
+        if missing:
+            raise RuntimeError(
+                f"หา URL ของตอน {missing[0]} ไม่พบ "
+                f"(พบถึงตอน {missing[0]-1})"
+            )
+
+        # Separate bounded pools. They are passed to the episode processor
+        # and reserved for future finer-grained stage parallelism.
+        # Episode workers themselves are controlled below.
+        with ThreadPoolExecutor(
+            max_workers=FETCH_WORKERS + TRANSLATE_WORKERS + TTS_WORKERS,
+            thread_name_prefix="novel-worker",
+        ) as pool:
+
+            for set_index, set_start in enumerate(
+                range(start, end + 1, per_set),
+                start=1,
+            ):
+                set_end = min(set_start + per_set - 1, end)
+                batch_total = set_end - set_start + 1
+
+                # Don't restart a fully completed batch after resume.
+                state_now = read_state(job_id)
+                all_done = all(
+                    state_now.get("episode_status", {})
+                    .get(str(ep), {})
+                    .get("status") == "done"
+                    for ep in range(set_start, set_end + 1)
+                )
+
+                if all_done:
+                    update_state(job_id, lambda s: (
+                        s.update({
+                            "current_set": set_index,
+                            "current_set_start": set_start,
+                            "current_set_end": set_end,
+                            "current_set_total": batch_total,
+                            "current_set_completed": batch_total,
+                            "current_set_finished_at": s.get("current_set_finished_at") or now_ts(),
+                            "stage": "set_completed",
+                            "message": f"ข้ามชุดที่ {set_index}: ทำเสร็จแล้ว",
+                        })
+                    ))
+                    continue
+
+                batch_start_time = now_ts()
+
+                def begin_batch(s):
+                    s["current_set"] = set_index
+                    s["current_set_start"] = set_start
+                    s["current_set_end"] = set_end
+                    s["current_set_total"] = batch_total
+                    s["current_set_completed"] = 0
+                    s["current_set_started_at"] = batch_start_time
+                    s["current_set_finished_at"] = None
+                    s["current_set_active_seconds"] = 0
+                    s["current_set_eta_seconds"] = None
+                    s["stage"] = "processing"
+                    s["message"] = f"กำลังสร้างชุดที่ {set_index}"
+                    s["last_activity_at"] = now_ts()
+
+                update_state(job_id, begin_batch)
+
+                # Submit episodes concurrently.
+                futures = {}
+
+                for ep in range(set_start, set_end + 1):
+                    status = read_state(job_id).get(
+                        "episode_status", {}
+                    ).get(str(ep), {}).get("status")
+
+                    if status == "done":
+                        continue
+
+                    ep_url = known_urls[str(ep)]
+
+                    future = pool.submit(
+                        process_episode_with_retry,
+                        job_id,
+                        ep,
+                        ep_url,
+                        pool,
+                        pool,
+                        pool,
+                    )
+                    futures[future] = ep
+
+                # Wait for episode futures while continuously writing progress.
+                for future in futures:
+                    ep = futures[future]
+
+                    try:
+                        future.result()
+                    except Exception as e:
+                        set_episode_status(
+                            job_id,
+                            ep,
+                            "failed",
+                            error=str(e),
+                        )
+
+                    refresh_progress_for_batch(
+                        job_id,
+                        set_start,
+                        set_end,
+                    )
+
+                # Final progress refresh.
+                refresh_progress_for_batch(
+                    job_id,
+                    set_start,
+                    set_end,
+                )
+
+                state_after = read_state(job_id)
+                failed_eps = [
+                    ep for ep in range(set_start, set_end + 1)
+                    if state_after.get("episode_status", {})
+                    .get(str(ep), {})
+                    .get("status") != "done"
+                ]
+
+                if failed_eps:
+                    # One extra self-heal pass for failed episodes.
+                    update_state(job_id, lambda s: (
+                        s.update({
+                            "stage": "self_heal",
+                            "message": f"กำลังซ่อมตอนที่ล้มเหลว {len(failed_eps)} ตอน",
+                        })
+                    ))
+
+                    for ep in failed_eps:
+                        process_episode_with_retry(
+                            job_id,
+                            ep,
+                            known_urls[str(ep)],
+                            pool,
+                            pool,
+                            pool,
+                        )
+                        refresh_progress_for_batch(
+                            job_id,
+                            set_start,
+                            set_end,
+                        )
+
+                state_after = read_state(job_id)
+
+                final_failed = [
+                    ep for ep in range(set_start, set_end + 1)
+                    if state_after.get("episode_status", {})
+                    .get(str(ep), {})
+                    .get("status") != "done"
+                ]
+
+                if final_failed:
+                    raise RuntimeError(
+                        f"ชุดที่ {set_index} ยังมีตอนที่สร้างไม่สำเร็จ: "
+                        f"{final_failed[:20]}"
+                    )
+
+                # ---------------- MERGE ----------------
+                def merging(s):
+                    s["stage"] = "merging"
+                    s["message"] = f"กำลังรวม MP3 ชุดที่ {set_index}"
+                    s["current_set_completed"] = batch_total
+
+                update_state(job_id, merging)
+
+                mp3_paths = [
+                    episode_paths(job_id, ep)["mp3"]
+                    for ep in range(set_start, set_end + 1)
+                ]
+
+                for p in mp3_paths:
+                    if not valid_mp3(p):
+                        raise RuntimeError(f"MP3 เสียหรือหาย: {p.name}")
+
+                novel_name = safe_filename(
+                    Path(urlparse(url).path).name or "novel"
+                )
+
+                set_name = (
+                    f"{novel_name}_EP_{set_start}-{set_end}"
+                )
+
+                output_mp3 = job_dir(job_id) / "batches" / f"{set_name}.mp3"
+                output_zip = job_dir(job_id) / "batches" / f"{set_name}.zip"
+
+                if not valid_mp3(output_mp3):
+                    merge_mp3s(mp3_paths, output_mp3)
+
+                # ---------------- ZIP ----------------
+                def zipping(s):
+                    s["stage"] = "zipping"
+                    s["message"] = f"กำลังสร้าง ZIP ชุดที่ {set_index}"
+
+                update_state(job_id, zipping)
+
+                if not output_zip.exists() or output_zip.stat().st_size < 100:
+                    zip_file(output_mp3, output_zip)
+
+                finish_time = now_ts()
+
+                def finish_batch(s):
+                    s["current_set_finished_at"] = finish_time
+                    s["current_set_active_seconds"] = finish_time - batch_start_time
+                    s["current_set_eta_seconds"] = 0
+                    s["current_set_completed"] = batch_total
+                    s["stage"] = "set_completed"
+                    s["message"] = f"ชุดที่ {set_index} เสร็จแล้ว"
+                    s.setdefault("set_outputs", {})[str(set_index)] = {
+                        "start": set_start,
+                        "end": set_end,
+                        "mp3": str(output_mp3),
+                        "zip": str(output_zip),
+                        "elapsed_seconds": finish_time - batch_start_time,
+                    }
+                    s["last_activity_at"] = finish_time
+
+                update_state(job_id, finish_batch)
+
+            # All sets complete.
+            def complete_job(s):
+                s["status"] = "completed"
+                s["stage"] = "completed"
+                s["message"] = "สร้างทั้งหมดเสร็จเรียบร้อย"
+                s["job_finished_at"] = now_ts()
+                s["last_activity_at"] = now_ts()
+                s["overall_completed"] = s["total_episodes"]
+
+            update_state(job_id, complete_job)
+
+    except Exception as e:
+        def fail_job(s):
+            s["status"] = "error"
+            s["stage"] = "error"
+            s["error"] = str(e)
+            s["message"] = "งานหยุดเพราะเกิดข้อผิดพลาด"
+            s["last_activity_at"] = now_ts()
+
+        update_state(job_id, fail_job)
+
+
+def start_job_thread(job_id: str):
+    with JOB_THREADS_LOCK:
+        t = JOB_THREADS.get(job_id)
+
+        if t and t.is_alive():
+            return False
+
+        t = threading.Thread(
+            target=run_job,
+            args=(job_id,),
+            daemon=True,
+            name=f"novel-job-{job_id}",
+        )
+        JOB_THREADS[job_id] = t
+        t.start()
+        return True
+
+
+# ============================================================
+# STREAMLIT UI
 # ============================================================
 
 st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🎙️",
-    layout="centered",
+    page_title="NOVEL AUDIO FACTORY V6",
+    page_icon="🎧",
+    layout="wide",
 )
 
-st.title(
-    APP_TITLE
-)
-
+st.title("🎧 NOVEL AUDIO FACTORY V6")
 st.caption(
-    "ใส่ข้อมูล 4 อย่าง แล้วกดเริ่มครั้งเดียว"
+    "Novel → Thai → Premwadee TTS → MP3 → Batch ZIP | "
+    "Live Progress + ETA + Resume + Self-Healing"
 )
 
-st.info(
-    "เสียงที่ใช้: Microsoft Edge TTS — "
-    "Premwadee (th-TH-PremwadeeNeural)"
-)
+with st.sidebar:
+    st.subheader("⚙️ ระบบ")
 
+    st.write(f"Version: **{APP_VERSION}**")
+    st.write(f"Voice: **{VOICE}**")
 
-# ============================================================
-# INPUT
-# ============================================================
-
-novel_url = st.text_input(
-    "1️⃣ ลิงก์นิยาย",
-    placeholder="วางลิงก์ตอนแรกที่นี่",
-)
-
-start_episode = st.number_input(
-    "2️⃣ ตอนเริ่มต้น",
-    min_value=1,
-    value=1,
-    step=1,
-)
-
-end_episode = st.number_input(
-    "3️⃣ ตอนสุดท้าย",
-    min_value=1,
-    value=500,
-    step=1,
-)
-
-episodes_per_batch = st.number_input(
-    "4️⃣ จำนวนตอนต่อชุด",
-    min_value=1,
-    value=50,
-    step=1,
-)
-
-
-# ============================================================
-# SUMMARY
-# ============================================================
-
-if end_episode >= start_episode:
-
-    total = (
-        int(end_episode)
-        - int(start_episode)
-        + 1
+    st.write(
+        f"Workers: Fetch {FETCH_WORKERS} / "
+        f"Translate {TRANSLATE_WORKERS} / TTS {TTS_WORKERS}"
     )
 
-    batches = (
-        total
-        + int(episodes_per_batch)
-        - 1
-    ) // int(episodes_per_batch)
-
-    st.success(
-        f"ระบบจะสร้างทั้งหมด "
-        f"{total} ตอน → "
-        f"{batches} ชุด"
+    st.info(
+        "หมายเหตุ: browser/Streamlit ไม่สามารถบังคับ Android "
+        "ให้ดาวน์โหลดหลายไฟล์แบบเงียบ ๆ ได้อย่างรับประกัน "
+        "จึงยังต้องกดดาวน์โหลดไฟล์จากหน้าเว็บ"
     )
 
 
-# ============================================================
-# START
-# ============================================================
+# ---------------- INPUT ----------------
 
-start = st.button(
-    "🚀 เริ่มสร้างทั้งหมด",
+st.subheader("📚 ตั้งค่างาน")
+
+url = st.text_input(
+    "Novel URL",
+    placeholder="https://example.com/chapter-1",
+)
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    start_episode = st.number_input(
+        "ตอนเริ่ม",
+        min_value=1,
+        value=1,
+        step=1,
+    )
+
+with col2:
+    end_episode = st.number_input(
+        "ตอนสุดท้าย",
+        min_value=1,
+        value=500,
+        step=1,
+    )
+
+with col3:
+    episodes_per_set = st.number_input(
+        "จำนวนตอนต่อชุด",
+        min_value=1,
+        value=50,
+        step=1,
+    )
+
+if end_episode < start_episode:
+    st.error("ตอนสุดท้ายต้องมากกว่าหรือเท่ากับตอนเริ่ม")
+
+total_episodes = max(0, int(end_episode) - int(start_episode) + 1)
+total_sets = (
+    (total_episodes + int(episodes_per_set) - 1)
+    // int(episodes_per_set)
+    if total_episodes
+    else 0
+)
+
+st.write(
+    f"📦 ทั้งหมด **{total_episodes} ตอน** → "
+    f"**{total_sets} ชุด**"
+)
+
+start_button = st.button(
+    "🚀 เริ่มสร้าง",
     type="primary",
     use_container_width=True,
 )
 
-
-if start:
-
-    if not novel_url.strip():
-
-        st.error(
-            "กรุณาใส่ลิงก์นิยาย"
-        )
-
+if start_button:
+    if not url.strip():
+        st.error("กรุณาใส่ Novel URL")
         st.stop()
 
     if end_episode < start_episode:
-
-        st.error(
-            "ตอนสุดท้ายต้องมากกว่าหรือเท่ากับตอนเริ่ม"
-        )
-
+        st.error("ช่วงตอนไม่ถูกต้อง")
         st.stop()
 
-    if episodes_per_batch < 1:
-
-        st.error(
-            "จำนวนตอนต่อชุดต้องมากกว่า 0"
-        )
-
-        st.stop()
-
-    progress_bar = st.progress(
-        0
+    job_id = job_id_from_inputs(
+        url,
+        int(start_episode),
+        int(end_episode),
+        int(episodes_per_set),
     )
 
-    status_box = st.empty()
+    ensure_state(
+        job_id,
+        url.strip(),
+        int(start_episode),
+        int(end_episode),
+        int(episodes_per_set),
+    )
 
-    episode_box = st.empty()
+    state = read_state(job_id)
 
-    started_at = time.time()
-
-    def update_progress(
-        current,
-        total,
-    ):
-        progress_bar.progress(
-            int(
-                current
-                / total
-                * 100
-            )
-        )
-
-    def update_status(
-        *args,
-    ):
-        text = " ".join(
-            str(x)
-            for x in args
-        )
-
-        status_box.info(
-            text
-        )
-
-    try:
-
-        result = asyncio.run(
-            run_job(
-                start_url=novel_url.strip(),
-                start_episode=int(
-                    start_episode
-                ),
-                end_episode=int(
-                    end_episode
-                ),
-                episodes_per_batch=int(
-                    episodes_per_batch
-                ),
-                progress_callback=
-                    update_progress,
-                status_callback=
-                    update_status,
-            )
-        )
-
-        elapsed = int(
-            time.time()
-            - started_at
-        )
-
-        progress_bar.progress(
-            100
-        )
-
-        status_box.success(
-            "🎉 สร้างเสร็จทั้งหมดแล้ว"
-        )
-
+    # If previous job errored/completed, keep checkpoint and resume.
+    if state.get("status") == "completed":
         st.success(
-            f"สร้าง {result['total_episodes']} "
-            f"ตอนสำเร็จใน "
-            f"{elapsed // 60} นาที "
-            f"{elapsed % 60} วินาที"
+            "งานนี้สร้างเสร็จแล้ว ระบบจะเปิดผลลัพธ์เดิมให้"
+        )
+    else:
+        start_job_thread(job_id)
+        st.session_state["job_id"] = job_id
+        st.rerun()
+
+
+# ---------------- SELECT / RESUME EXISTING ----------------
+
+job_id = st.session_state.get("job_id")
+
+if not job_id:
+    # If there is a matching state, don't automatically start it.
+    candidate = job_id_from_inputs(
+        url.strip() if url else "",
+        int(start_episode),
+        int(end_episode),
+        int(episodes_per_set),
+    )
+
+    if url.strip() and (job_dir(candidate) / "state.json").exists():
+        job_id = candidate
+        st.session_state["job_id"] = job_id
+
+
+if job_id:
+    state = read_state(job_id)
+
+    if not state:
+        st.error("ไม่พบข้อมูล job")
+        st.stop()
+
+    # Keep worker alive across Streamlit reruns.
+    if state.get("status") == "running":
+        start_job_thread(job_id)
+
+    st.divider()
+    st.subheader("📊 ความคืบหน้า")
+
+    current_set = int(state.get("current_set") or 0)
+    total_sets_state = int(state.get("total_sets") or total_sets or 0)
+
+    overall_done = int(state.get("overall_completed") or 0)
+    overall_total = int(state.get("total_episodes") or total_episodes or 0)
+
+    overall_percent = (
+        overall_done / overall_total * 100
+        if overall_total
+        else 0
+    )
+
+    # ---------------- CURRENT SET ----------------
+    st.markdown(
+        f"### 📦 ชุดที่ {current_set} / {total_sets_state}"
+    )
+
+    set_start = state.get("current_set_start")
+    set_end = state.get("current_set_end")
+
+    if set_start and set_end:
+        st.write(f"ตอน **{set_start} – {set_end}**")
+
+    batch_total = int(state.get("current_set_total") or 0)
+    batch_done = int(state.get("current_set_completed") or 0)
+
+    metrics = calculate_batch_metrics(state)
+
+    batch_percent = metrics["percent"]
+    elapsed = metrics["elapsed"]
+    eta = metrics["eta"]
+    rate = metrics["rate"]
+
+    st.progress(
+        min(1.0, max(0.0, batch_percent / 100))
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    with m1:
+        st.metric(
+            "ชุดนี้เสร็จแล้ว",
+            f"{batch_done} / {batch_total}",
         )
 
-        # ------------------------------------
-        # BATCH DOWNLOAD
-        # ------------------------------------
-
-        st.subheader(
-            "📦 ไฟล์ชุด"
+    with m2:
+        st.metric(
+            "ความคืบหน้าชุดนี้",
+            f"{batch_percent:.1f}%",
         )
 
-        for index, path in enumerate(
-            result["batches"],
-            start=1,
+    with m3:
+        st.metric(
+            "เวลาที่ใช้",
+            format_duration(elapsed),
+            help=format_seconds_exact(elapsed),
+        )
+
+    with m4:
+        st.metric(
+            "เหลือประมาณ",
+            format_duration(eta),
+            help=(
+                format_seconds_exact(eta)
+                if eta is not None
+                else "รอข้อมูลเพิ่มเพื่อคำนวณ ETA"
+            ),
+        )
+
+    if rate > 0:
+        st.caption(
+            f"⚡ ความเร็วเฉลี่ยชุดนี้: {rate * 60:.2f} ตอน/นาที"
+        )
+
+    stage = state.get("stage", "waiting")
+    message = state.get("message", "")
+
+    st.info(
+        f"สถานะ: **{stage}** — {message}"
+    )
+
+    # ---------------- OVERALL ----------------
+    st.markdown("### 🌍 ภาพรวมทั้งหมด")
+
+    st.progress(
+        min(1.0, max(0.0, overall_percent / 100))
+    )
+
+    o1, o2, o3 = st.columns(3)
+
+    with o1:
+        st.metric(
+            "ตอนเสร็จแล้ว",
+            f"{overall_done} / {overall_total}",
+        )
+
+    with o2:
+        st.metric(
+            "ความคืบหน้ารวม",
+            f"{overall_percent:.1f}%",
+        )
+
+    with o3:
+        st.metric(
+            "ตอนที่ล้มเหลว",
+            str(state.get("overall_failed") or 0),
+        )
+
+    # ---------------- EPISODE TABLE ----------------
+    if set_start and set_end:
+        statuses = state.get("episode_status", {})
+
+        rows = []
+
+        for ep in range(int(set_start), int(set_end) + 1):
+            item = statuses.get(str(ep), {})
+            rows.append({
+                "ตอน": ep,
+                "สถานะ": item.get("status", "รอ"),
+                "ข้อความผิดพลาด": item.get("error", ""),
+            })
+
+        st.dataframe(
+            rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # ---------------- OUTPUTS ----------------
+    st.markdown("### 📥 ไฟล์ที่สร้างแล้ว")
+
+    outputs = state.get("set_outputs", {})
+
+    if outputs:
+        for set_no in sorted(
+            outputs.keys(),
+            key=lambda x: int(x),
+            reverse=True,
         ):
+            out = outputs[set_no]
 
-            if not os.path.exists(
-                path
-            ):
-                continue
-
-            filename = os.path.basename(
-                path
+            st.write(
+                f"**ชุดที่ {set_no}: ตอน "
+                f"{out['start']}–{out['end']}**"
             )
 
-            with open(
-                path,
-                "rb",
-            ) as f:
+            c1, c2 = st.columns(2)
 
-                data = f.read()
+            zip_path = Path(out["zip"])
+            mp3_path = Path(out["mp3"])
 
-            st.download_button(
-                f"⬇️ {filename}",
-                data=data,
-                file_name=filename,
-                mime="audio/mpeg",
-                key=(
-                    "download_batch_"
-                    + str(index)
-                    + "_"
-                    + filename
-                ),
-                use_container_width=True,
-            )
+            with c1:
+                if zip_path.exists():
+                    with zip_path.open("rb") as f:
+                        st.download_button(
+                            "⬇️ ดาวน์โหลด ZIP",
+                            data=f.read(),
+                            file_name=zip_path.name,
+                            mime="application/zip",
+                            key=f"zip_{job_id}_{set_no}",
+                            use_container_width=True,
+                        )
 
-        # ------------------------------------
-        # ALL ZIP
-        # ------------------------------------
+            with c2:
+                if mp3_path.exists():
+                    with mp3_path.open("rb") as f:
+                        st.download_button(
+                            "🎧 ดาวน์โหลด MP3",
+                            data=f.read(),
+                            file_name=mp3_path.name,
+                            mime="audio/mpeg",
+                            key=f"mp3_{job_id}_{set_no}",
+                            use_container_width=True,
+                        )
 
-        if os.path.exists(
-            result["zip"]
-        ):
+    # ---------------- STATUS ----------------
+    if state.get("status") == "completed":
+        st.success("🎉 งานทั้งหมดเสร็จเรียบร้อยแล้ว")
 
-            st.subheader(
-                "📚 ดาวน์โหลดทั้งหมด"
-            )
-
-            with open(
-                result["zip"],
-                "rb",
-            ) as f:
-
-                zip_data = f.read()
-
-            st.download_button(
-                "⬇️ ดาวน์โหลดทุกชุดเป็น ZIP",
-                data=zip_data,
-                file_name=(
-                    "นิยายเสียง_ทั้งหมด.zip"
-                ),
-                mime="application/zip",
-                key="download_all_zip",
-                use_container_width=True,
-            )
-
-        st.success(
-            "งานทั้งหมดเสร็จแล้ว"
-        )
-
-    except Exception as e:
-
+    elif state.get("status") == "error":
         st.error(
-            "ระบบหยุดจากข้อผิดพลาด: "
-            + str(e)
+            f"❌ งานหยุด: {state.get('error', 'ไม่ทราบสาเหตุ')}"
         )
 
-        st.warning(
-            "Checkpoint ถูกบันทึกไว้ "
-            "ไฟล์ที่สร้างสำเร็จแล้วจะไม่ถูกทำซ้ำ "
-            "เมื่อเริ่มงานใหม่"
-        )
+    elif state.get("status") == "running":
+        # Rerun automatically so the UI follows the background job.
+        time.sleep(1.0)
+        st.rerun()
 
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "ระบบจะตรวจสอบไฟล์ที่มีอยู่แล้ว "
-    "และพยายามกู้คืนงานที่ค้างโดยอัตโนมัติ"
-                    )
+    elif state.get("status") == "idle":
+        st.info("กด เริ่มสร้าง เพื่อเริ่มงาน")
