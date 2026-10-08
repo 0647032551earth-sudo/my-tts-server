@@ -47,7 +47,7 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_VERSION = "V7.0"
+APP_VERSION = "V7.2"
 VOICE = "th-TH-PremwadeeNeural"
 
 BASE_DIR = Path(__file__).resolve().parent / "novel_audio_jobs"
@@ -1334,15 +1334,34 @@ def run_job(job_id: str):
         update_state(job_id, fail_job)
 
 
+def _job_thread_entry(job_id: str):
+    try:
+        update_state(job_id, lambda s: s.update({
+            "status": "running",
+            "stage": "crawling",
+            "message": "กำลังค้นหาลิงก์ตอนจริง...",
+            "last_activity_at": now_ts(),
+        }))
+        run_job(job_id)
+    except Exception as e:
+        # Last-resort guard: an exception escaping the worker must never leave
+        # the UI permanently stuck at starting/running.
+        update_state(job_id, lambda s: s.update({
+            "status": "error",
+            "stage": "error",
+            "message": "Worker หยุดทำงาน",
+            "error": str(e),
+            "last_activity_at": now_ts(),
+        }))
+
+
 def start_job_thread(job_id: str):
     with JOB_THREADS_LOCK:
         t = JOB_THREADS.get(job_id)
-
         if t and t.is_alive():
             return False
-
         t = threading.Thread(
-            target=run_job,
+            target=_job_thread_entry,
             args=(job_id,),
             daemon=True,
             name=f"novel-job-{job_id}",
@@ -1488,28 +1507,33 @@ if start_button:
         # IMPORTANT: set RUNNING before launching the thread.
         # This removes the race where the page stayed at waiting / 0 / 0.
         def mark_running(s):
+            # Set the visible stage to crawling BEFORE launching the background
+            # thread. This prevents the UI from getting stuck at "starting"
+            # when Streamlit reruns immediately after the button click.
             s["status"] = "running"
-            s["stage"] = "starting"
-            s["message"] = "กำลังเริ่มระบบ..."
+            s["stage"] = "crawling"
+            s["message"] = "กำลังค้นหาลิงก์ตอนจริง..."
             s["job_started_at"] = s.get("job_started_at") or now_ts()
             s["last_activity_at"] = now_ts()
             s["error"] = None
 
         update_state(job_id, mark_running)
-        # Verify the checkpoint exists before the UI reruns. This prevents
-        # a transient "job not found" screen on slow filesystems.
         if not (job_dir(job_id) / "state.json").exists():
-            ensure_state(
-                job_id,
-                url.strip(),
-                int(start_episode),
-                int(end_episode),
-                int(episodes_per_set),
-            )
+            ensure_state(job_id, url.strip(), int(start_episode), int(end_episode), int(episodes_per_set))
             update_state(job_id, mark_running)
         st.session_state["job_id"] = job_id
-        start_job_thread(job_id)
-        st.rerun()
+        started_ok = start_job_thread(job_id)
+        if not started_ok:
+            with JOB_THREADS_LOCK:
+                alive = bool(JOB_THREADS.get(job_id) and JOB_THREADS[job_id].is_alive())
+            if not alive:
+                update_state(job_id, lambda s: s.update({
+                    "status": "error",
+                    "stage": "error",
+                    "message": "ไม่สามารถเริ่ม worker ได้",
+                    "error": "Background worker ไม่เริ่มทำงาน",
+                    "last_activity_at": now_ts(),
+                }))
 
 
 # ---------------- SELECT / RESUME EXISTING ----------------
