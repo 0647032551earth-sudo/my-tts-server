@@ -1,5 +1,5 @@
 import streamlit as st
-from gTTS import gTTS
+from gtts import gTTS
 import os
 
 st.set_page_config(page_title="Text to Speech", page_icon="🗣️")
