@@ -1,4 +1,4 @@
-# NOVEL AUDIO FACTORY V6
+# NOVEL AUDIO FACTORY V7 UNIVERSAL
 # Streamlit app for crawling novel chapters -> Thai translation -> Edge TTS -> batch MP3 + ZIP
 #
 # V6 improvements:
@@ -47,7 +47,7 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_VERSION = "V6.1"
+APP_VERSION = "V7.0"
 VOICE = "th-TH-PremwadeeNeural"
 
 BASE_DIR = Path("novel_audio_jobs")
@@ -375,17 +375,9 @@ def find_next_url(current_url: str, html: str) -> Optional[str]:
         if any(word in label for word in next_words):
             return urljoin(current_url, link["href"])
 
-    # Try numeric chapter URL increment.
-    parsed = urlparse(current_url)
-    path = parsed.path
-
-    m = re.search(r"(\d+)(?!.*\d)", path)
-    if m:
-        n = int(m.group(1))
-        next_path = path[:m.start(1)] + str(n + 1) + path[m.end(1):]
-        candidate = parsed._replace(path=next_path).geturl()
-        return candidate
-
+    # IMPORTANT: do not fabricate a chapter URL here. Some sites use slugs
+    # that cannot be derived by incrementing a number, and doing so caused
+    # Old V6.1 used URL-number guessing; V7 never fabricates chapter URLs.
     return None
 
 
@@ -548,14 +540,10 @@ def load_cached_text(path: Path) -> Optional[str]:
 
 
 def infer_episode_number_from_url(url: str) -> Optional[int]:
-    """Detect chapter/episode number embedded in a URL."""
+    """Best-effort chapter number detection; never used to fabricate URLs."""
     patterns = [
-        r"/chapter[-_/](\d+)",
-        r"/episode[-_/](\d+)",
-        r"/ep[-_/](\d+)",
-        r"chapter[-_](\d+)",
-        r"episode[-_](\d+)",
-        r"ep[-_](\d+)",
+        r"(?:chapter|chap|episode|ep)[-_ /]*(\d+)",
+        r"/(\d+)(?:[/?#]|$)",
     ]
     for pattern in patterns:
         m = re.search(pattern, url or "", flags=re.IGNORECASE)
@@ -563,92 +551,193 @@ def infer_episode_number_from_url(url: str) -> Optional[int]:
             try:
                 return int(m.group(1))
             except Exception:
-                return None
+                pass
     return None
 
 
-def jump_url_to_episode(url: str, target_episode: int) -> Optional[str]:
-    """Replace the numeric chapter/episode part of a URL."""
-    patterns = [
-        r"(/chapter[-_/])(\d+)",
-        r"(/episode[-_/])(\d+)",
-        r"(/ep[-_/])(\d+)",
-        r"(chapter[-_])(\d+)",
-        r"(episode[-_])(\d+)",
-        r"(ep[-_])(\d+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, url or "", flags=re.IGNORECASE)
+def infer_episode_number_from_html(html: str) -> Optional[int]:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
+    if soup.title:
+        candidates.append(soup.title.get_text(" ", strip=True))
+    for tag in soup.find_all(["h1", "h2", "h3"]):
+        candidates.append(tag.get_text(" ", strip=True))
+    for text in candidates:
+        m = re.search(r"(?:chapter|chap|episode|ep|ตอน|บท)\s*[-#:： ]*\s*(\d+)", text, re.I)
         if m:
-            return url[:m.start(2)] + str(target_episode) + url[m.end(2):]
+            return int(m.group(1))
+    return None
+
+
+def _link_episode_number(anchor, current_url: str) -> Optional[int]:
+    href = urljoin(current_url, anchor.get("href", ""))
+    label = anchor.get_text(" ", strip=True)
+    blob = f"{label} {href}"
+    return infer_episode_number_from_url(blob) or infer_episode_number_from_html(label)
+
+
+def extract_real_chapter_links(current_url: str, html: str) -> dict[int, str]:
+    """Extract real chapter links already present in the page/TOC.
+
+    This is deliberately heuristic and cross-site. It only returns URLs that
+    actually occur in the HTML; it never invents a URL by changing a number.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    found = {}
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href or href.startswith(("javascript:", "mailto:", "#")):
+            continue
+        url = urljoin(current_url, href)
+        if urlparse(url).scheme not in ("http", "https"):
+            continue
+        n = _link_episode_number(a, current_url)
+        if n is None:
+            continue
+        # Avoid treating the same page as a chapter link when the label is generic.
+        label = a.get_text(" ", strip=True).lower()
+        if n > 0 and (re.search(r"(?:chapter|chap|episode|ep|ตอน|บท)", label + " " + href, re.I)):
+            found.setdefault(n, url)
+    return found
+
+
+def find_toc_urls(current_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    keys = ("table of contents", "contents", "chapters", "chapter list", "สารบัญ", "รายการตอน")
+    out = []
+    for a in soup.find_all("a", href=True):
+        label = a.get_text(" ", strip=True).lower()
+        href = a.get("href", "")
+        blob = f"{label} {href}".lower()
+        if any(k in blob for k in keys):
+            u = urljoin(current_url, href)
+            if u not in out and urlparse(u).scheme in ("http", "https"):
+                out.append(u)
+    return out[:5]
+
+
+def find_next_url(current_url: str, html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Semantic rel=next.
+    for link in soup.find_all("a", href=True):
+        rel = [str(x).lower() for x in (link.get("rel") or [])]
+        if "next" in rel:
+            return urljoin(current_url, link["href"])
+
+    # 2) Common next-button labels/classes.
+    patterns = [
+        r"^next(?:\s+chapter)?$",
+        r"^next\s*chapter",
+        r"next\s*chapter",
+        r"^ตอนต่อไป$",
+        r"ตอนต่อไป",
+        r"บทต่อไป",
+        r"ตอนถัดไป",
+        r"ถัดไป",
+        r"下一章",
+        r"下一页",
+    ]
+    candidates = []
+    for link in soup.find_all("a", href=True):
+        label = link.get_text(" ", strip=True)
+        blob = f"{label} {link.get('class', '')} {link.get('id', '')}".lower()
+        if any(re.search(p, blob, re.I) for p in patterns):
+            candidates.append(urljoin(current_url, link["href"]))
+    if candidates:
+        return candidates[0]
     return None
 
 
 def discover_episode_urls(job_id: str, start_url: str, start_episode: int, end_episode: int):
-    """
-    Discover only the requested range.
+    """Universal multi-site chapter discovery.
 
-    If the supplied URL contains a chapter number different from the requested
-    start episode, try to jump directly to that episode instead of crawling
-    every previous chapter.
+    Priority:
+      A. Cached real URLs from a previous run.
+      B. Real chapter links embedded in the supplied page.
+      C. A real Table-of-Contents link embedded in the supplied page.
+      D. Real Next navigation, walking only actual links.
+
+    Never fabricates a chapter URL. A 404 is retried and then treated as a
+    discovery failure for that URL, not as failure of every requested episode.
     """
+    total = end_episode - start_episode + 1
     state = read_state(job_id)
-    known = state.get("episode_urls", {}) or {}
+    known = {str(k): v for k, v in (state.get("episode_urls") or {}).items()
+             if start_episode <= int(k) <= end_episode}
 
-    missing = [
-        ep for ep in range(start_episode, end_episode + 1)
-        if str(ep) not in known
-    ]
-    if not missing:
+    def save(msg, stage="discovery"):
+        update_state(job_id, lambda s: s.update({
+            "episode_urls": known,
+            "stage": stage,
+            "message": msg,
+            "last_activity_at": now_ts(),
+        }))
+
+    if len(known) == total:
+        save(f"มีลิงก์ตอนจริงใน checkpoint ครบ {start_episode}-{end_episode}", "discovery_complete")
         return known
 
-    first_needed = missing[0]
-    current_url = start_url
-
-    supplied_number = infer_episode_number_from_url(start_url)
-    if supplied_number is not None and supplied_number != first_needed:
-        jumped = jump_url_to_episode(start_url, first_needed)
-        if jumped:
-            current_url = jumped
-
-    current_episode = first_needed
     visited = set()
+    queue = [start_url]
+    page_limit = max(250, (end_episode - start_episode + 1) * 8)
 
-    while current_episode <= end_episode and current_url:
-        if current_url in visited:
-            break
-
+    while queue and len(visited) < page_limit:
+        current_url = queue.pop(0)
+        if not current_url or current_url in visited:
+            continue
         visited.add(current_url)
-        ep_key = str(current_episode)
 
-        if ep_key not in known:
-            known[ep_key] = current_url
-
-            def upd(s, ep=current_episode, u=current_url):
-                s["episode_urls"] = known
-                s["last_activity_at"] = now_ts()
-                s["stage"] = "crawling"
-                s["message"] = f"พบ URL ตอนที่ {ep}"
-
-            update_state(job_id, upd)
-
+        save(f"กำลังค้นหาลิงก์ตอนจริง ({len(known)}/{total})\n{current_url}")
         try:
             html = fetch_html(current_url)
-            next_url = find_next_url(current_url, html)
-        except Exception:
-            next_url = None
+        except Exception as e:
+            # If this was a queued TOC candidate, ignore it and continue with
+            # other real navigation links. If it is the only path, fail clearly.
+            save(f"เปิดลิงก์ไม่ได้ กำลังลองเส้นทางอื่น: {current_url}", "discovery_retry")
+            continue
 
-        # If the site's Next link cannot be detected, try changing the
-        # chapter number in the current URL.
-        if not next_url:
-            next_url = jump_url_to_episode(
-                current_url,
-                current_episode + 1,
-            )
+        actual = infer_episode_number_from_url(current_url) or infer_episode_number_from_html(html)
+        if actual is not None and start_episode <= actual <= end_episode:
+            known.setdefault(str(actual), current_url)
 
-        current_episode += 1
-        current_url = next_url
+        # A page may expose a whole chapter list. Use those real hrefs first.
+        page_links = extract_real_chapter_links(current_url, html)
+        for n, u in sorted(page_links.items()):
+            if start_episode <= n <= end_episode:
+                known.setdefault(str(n), u)
 
+        if len(known) == total:
+            break
+
+        # TOC links are real links, never generated URLs.
+        for toc in find_toc_urls(current_url, html):
+            if toc not in visited:
+                queue.insert(0, toc)
+
+        # If requested start is later than supplied page, real Next navigation
+        # remains the universal fallback. Add it to the queue.
+        nxt = find_next_url(current_url, html)
+        if nxt and nxt not in visited:
+            queue.append(nxt)
+
+        # Prioritize a real link to the first missing episode if one exists.
+        missing = [ep for ep in range(start_episode, end_episode + 1) if str(ep) not in known]
+        if missing:
+            target = missing[0]
+            direct_real = page_links.get(target)
+            if direct_real and direct_real not in visited:
+                queue.insert(0, direct_real)
+
+    missing = [ep for ep in range(start_episode, end_episode + 1) if str(ep) not in known]
+    if missing:
+        first = missing[0]
+        raise RuntimeError(
+            f"ค้นหาลิงก์ตอนจริงไม่ครบ: ขาดตอน {first} เป็นต้นไป "
+            f"(ตรวจแล้ว {len(visited)} หน้า, พบ {len(known)}/{total} ตอน)"
+        )
+
+    save(f"พบลิงก์จริงครบตอน {start_episode}-{end_episode}", "discovery_complete")
     return known
 
 
@@ -668,86 +757,76 @@ def set_episode_status(job_id: str, episode: int, status: str, **extra):
     update_state(job_id, upd)
 
 
-def process_episode(job_id: str, episode: int, url: str, fetch_pool, translate_pool, tts_pool):
+def _fetch_episode_stage(job_id: str, episode: int, url: str):
     paths = episode_paths(job_id, episode)
+    if paths["raw"].exists():
+        raw = load_cached_text(paths["raw"])
+        title = read_state(job_id).get("episode_titles", {}).get(str(episode), "")
+        if raw:
+            return title, raw
+    html = fetch_html(url)
+    paths["html"].parent.mkdir(parents=True, exist_ok=True)
+    paths["html"].write_text(html, encoding="utf-8")
+    title, raw = extract_novel_text(html)
+    paths["raw"].parent.mkdir(parents=True, exist_ok=True)
+    paths["raw"].write_text(raw, encoding="utf-8")
+    update_state(job_id, lambda s: s.setdefault("episode_titles", {}).update({str(episode): title}))
+    return title, raw
 
-    # ---------------- FETCH / EXTRACT ----------------
-    set_episode_status(job_id, episode, "fetching")
 
+def _translate_episode_stage(job_id: str, episode: int, raw_text: str):
+    paths = episode_paths(job_id, episode)
+    cached = load_cached_text(paths["translated"])
+    if cached:
+        return cached
+    translated = translate_text(raw_text)
+    paths["translated"].parent.mkdir(parents=True, exist_ok=True)
+    paths["translated"].write_text(translated, encoding="utf-8")
+    return translated
+
+
+def _tts_episode_stage(job_id: str, episode: int, translated: str):
+    paths = episode_paths(job_id, episode)
+    if not valid_mp3(paths["mp3"]):
+        if paths["mp3"].exists():
+            try: paths["mp3"].unlink()
+            except Exception: pass
+        run_tts_sync(translated, paths["mp3"])
+    if not valid_mp3(paths["mp3"]):
+        raise RuntimeError("MP3 ตรวจสอบแล้วไม่ผ่าน")
+    return paths["mp3"]
+
+
+def process_episode(job_id: str, episode: int, url: str, fetch_pool, translate_pool, tts_pool):
+    """Run one episode through real fetch -> translate -> TTS stage pools.
+
+    Different episodes can occupy different stages simultaneously. Successful
+    stages are cached, so a retry resumes at the first missing/invalid stage.
+    """
     try:
-        if paths["raw"].exists():
-            raw_text = load_cached_text(paths["raw"])
-            title = read_state(job_id).get("episode_titles", {}).get(str(episode), "")
-            if not raw_text:
-                raise RuntimeError("cache ข้อความเสีย")
-        else:
-            html = fetch_html(url)
-            paths["html"].parent.mkdir(parents=True, exist_ok=True)
-            paths["html"].write_text(html, encoding="utf-8")
-
-            title, raw_text = extract_novel_text(html)
-            paths["raw"].parent.mkdir(parents=True, exist_ok=True)
-            paths["raw"].write_text(raw_text, encoding="utf-8")
-
-            def upd_title(s):
-                s.setdefault("episode_titles", {})[str(episode)] = title
-
-            update_state(job_id, upd_title)
-
+        set_episode_status(job_id, episode, "fetching")
+        fetch_future = fetch_pool.submit(_fetch_episode_stage, job_id, episode, url)
+        title, raw_text = fetch_future.result()
         if len(raw_text) < MIN_TEXT_CHARS:
             raise RuntimeError("เนื้อหาตอนสั้นผิดปกติ")
 
-    except Exception as e:
-        set_episode_status(job_id, episode, "failed", error=f"FETCH: {e}")
-        raise
-
-    # ---------------- TRANSLATE ----------------
-    set_episode_status(job_id, episode, "translating")
-
-    try:
-        translated = load_cached_text(paths["translated"])
-
-        if not translated:
-            translated = translate_text(raw_text)
-            paths["translated"].parent.mkdir(parents=True, exist_ok=True)
-            paths["translated"].write_text(translated, encoding="utf-8")
-
+        set_episode_status(job_id, episode, "translating", title=title)
+        translate_future = translate_pool.submit(_translate_episode_stage, job_id, episode, raw_text)
+        translated = translate_future.result()
         if len(translated) < 10:
             raise RuntimeError("ข้อความแปลว่าง/สั้นเกินไป")
 
+        set_episode_status(job_id, episode, "tts")
+        tts_future = tts_pool.submit(_tts_episode_stage, job_id, episode, translated)
+        mp3 = tts_future.result()
+
+        set_episode_status(job_id, episode, "done", mp3=str(mp3), finished_at=now_ts())
+        return True
     except Exception as e:
-        set_episode_status(job_id, episode, "failed", error=f"TRANSLATE: {e}")
+        current = read_state(job_id).get("episode_status", {}).get(str(episode), {}).get("status")
+        if current != "retrying":
+            set_episode_status(job_id, episode, "failed", error=str(e))
         raise
-
-    # ---------------- TTS ----------------
-    set_episode_status(job_id, episode, "tts")
-
-    try:
-        if not valid_mp3(paths["mp3"]):
-            if paths["mp3"].exists():
-                try:
-                    paths["mp3"].unlink()
-                except Exception:
-                    pass
-
-            run_tts_sync(translated, paths["mp3"])
-
-        if not valid_mp3(paths["mp3"]):
-            raise RuntimeError("MP3 ตรวจสอบแล้วไม่ผ่าน")
-
-    except Exception as e:
-        set_episode_status(job_id, episode, "failed", error=f"TTS: {e}")
-        raise
-
-    set_episode_status(
-        job_id,
-        episode,
-        "done",
-        mp3=str(paths["mp3"]),
-        finished_at=now_ts(),
-    )
-
-    return True
 
 
 # ============================================================
@@ -1018,13 +1097,12 @@ def run_job(job_id: str):
                 f"(พบถึงตอน {missing[0]-1})"
             )
 
-        # Separate bounded pools. They are passed to the episode processor
-        # and reserved for future finer-grained stage parallelism.
-        # Episode workers themselves are controlled below.
-        with ThreadPoolExecutor(
-            max_workers=FETCH_WORKERS + TRANSLATE_WORKERS + TTS_WORKERS,
-            thread_name_prefix="novel-worker",
-        ) as pool:
+        # True stage pools: different episodes can be fetching, translating,
+        # and synthesizing at the same time. No artificial success delay.
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS, thread_name_prefix="fetch") as fetch_pool, \
+             ThreadPoolExecutor(max_workers=TRANSLATE_WORKERS, thread_name_prefix="translate") as translate_pool, \
+             ThreadPoolExecutor(max_workers=TTS_WORKERS, thread_name_prefix="tts") as tts_pool, \
+             ThreadPoolExecutor(max_workers=max(FETCH_WORKERS, TRANSLATE_WORKERS, TTS_WORKERS), thread_name_prefix="episode") as episode_pool:
 
             for set_index, set_start in enumerate(
                 range(start, end + 1, per_set),
@@ -1088,14 +1166,14 @@ def run_job(job_id: str):
 
                     ep_url = known_urls[str(ep)]
 
-                    future = pool.submit(
+                    future = episode_pool.submit(
                         process_episode_with_retry,
                         job_id,
                         ep,
                         ep_url,
-                        pool,
-                        pool,
-                        pool,
+                        fetch_pool,
+                        translate_pool,
+                        tts_pool,
                     )
                     futures[future] = ep
 
@@ -1148,9 +1226,9 @@ def run_job(job_id: str):
                             job_id,
                             ep,
                             known_urls[str(ep)],
-                            pool,
-                            pool,
-                            pool,
+                            fetch_pool,
+                            translate_pool,
+                            tts_pool,
                         )
                         refresh_progress_for_batch(
                             job_id,
@@ -1284,7 +1362,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🎧 NOVEL AUDIO FACTORY V6.1")
+st.title("🎧 NOVEL AUDIO FACTORY V7 UNIVERSAL")
 st.caption(
     "Novel → Thai → Premwadee TTS → MP3 → Batch ZIP | "
     "Live Progress + ETA + Resume + Self-Healing"
@@ -1364,8 +1442,8 @@ if detected_input_episode is not None and int(start_episode) != detected_input_e
     st.info(
         f"🔎 URL นี้มีเลขตอนประมาณ **{detected_input_episode}** "
         f"แต่คุณเลือกเริ่มที่ **{int(start_episode)}** — "
-        f"V6.1 จะพยายามกระโดดไปตอนที่ {int(start_episode)} "
-        f"โดยไม่ไล่ตั้งแต่ตอนที่ 1"
+        "V7 จะค้นหาลิงก์ตอนจริงจากหน้าเว็บ/สารบัญ/ปุ่ม Next "
+        "โดยไม่สร้าง URL เดาจากเลขตอน"
     )
 
 start_button = st.button(
