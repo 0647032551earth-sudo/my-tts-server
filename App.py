@@ -8,12 +8,12 @@ import re
 import os
 import time
 
-st.set_page_config(page_title="Novel to Speech - Turbo 50 Chapters", page_icon="🚀")
+st.set_page_config(page_title="Novel to Speech - Auto Rename Batch", page_icon="📦")
 
-st.title("🚀 ระบบดึงนิยาย + แปลไทย + สร้างเสียง (Turbo 50 Chapters - พร้อม Progress & Timer)")
+st.title("📦 ระบบดึงนิยายแบ่งเป็นชุด + ตั้งชื่อไฟล์ตามตอนอัตโนมัติ")
 
 if "novel_text" not in st.session_state:
-    st.session_state.novel_text = "วางลิงก์ตอนเริ่มต้นด้านบน แล้วระบุช่วงตอนที่ต้องการดึง หรือพิมพ์ข้อความภาษาไทยที่นี่ได้เลยครับ"
+    st.session_state.novel_text = "วางลิงก์ตอนเริ่มต้นด้านบน แล้วกำหนดช่วงตอนและขนาดชุดที่ต้องการได้เลยครับ"
 
 def fast_translate(text, src_lang='auto', dest_lang='th'):
     if not text.strip():
@@ -73,22 +73,26 @@ async def text_to_speech_fast(text, voice, output_file):
                 os.remove(sf)
 
 # ตั้งค่าหน้าจอการใช้งาน
-st.subheader("🔗 ตั้งค่าช่วงตอน (รองรับสูงสุด 50+ ตอนรวดเดียว)")
+st.subheader("🔗 ตั้งค่าช่วงตอนและขนาดชุด (Batch Settings)")
 start_url = st.text_input("วางลิงก์หน้าเว็บนิยาย 'ตอนเริ่มต้น':", "")
 
-col_a, col_b, col_c = st.columns(3)
-with col_a:
+col_1, col_2, col_3 = st.columns(3)
+with col_1:
     start_ep = st.number_input("เริ่มต้นที่ตอนที่:", min_value=1, value=1)
-with col_b:
-    end_ep = st.number_input("สิ้นสุดที่ตอนที่ (เช่น 50):", min_value=1, value=50)
-with col_c:
-    src_lang = st.selectbox("ภาษาต้นทาง:", ["auto", "zh-CN", "en", "ja"], index=0)
+with col_2:
+    end_ep = st.number_input("สิ้นสุดที่ตอนที่ (เช่น 500):", min_value=1, value=100)
+with col_3:
+    batch_size = st.number_input("จำนวนตอนต่อ 1 ชุด (Batch):", min_value=1, value=50)
 
-voice_choice = st.selectbox("เลือกเสียงพากย์:", ["th-TH-PremwadeeNeural", "th-TH-NiwatNeural"], index=0)
+col_4, col_5 = st.columns(2)
+with col_4:
+    src_lang = st.selectbox("ภาษาต้นทาง:", ["auto", "zh-CN", "en", "ja"], index=0)
+with col_5:
+    voice_choice = st.selectbox("เลือกเสียงพากย์:", ["th-TH-PremwadeeNeural", "th-TH-NiwatNeural"], index=0)
 
 # ช่องแสดงข้อความ
-st.subheader("✍️ ข้อความนิยายรวมทุกตอน")
-st.session_state.novel_text = st.text_area("ข้อความภาษาไทยสำหรับสร้างเสียง:", value=st.session_state.novel_text, height=200)
+st.subheader("✍️ ข้อความนิยายภาพรวม")
+st.session_state.novel_text = st.text_area("ข้อความภาษาไทยสำหรับสร้างเสียง:", value=st.session_state.novel_text, height=180)
 
 char_count = len(st.session_state.novel_text)
 st.caption(f"📊 สถิติข้อความปัจจุบัน: **{char_count:,}** ตัวอักษร")
@@ -105,119 +109,117 @@ with col_btn2:
         st.session_state.novel_text = ""
         st.rerun()
 
-# ปุ่มรันความเร็วสูงพร้อม Progress และ Timer
-st.subheader("🎙️ ระบบสร้างเสียงความเร็วสูง (Turbo 50 Episodes)")
-if st.button("🚀 เริ่มแปลง 50 ตอนอัตโนมัติแบบความเร็วสูง"):
+# ปุ่มเริ่มกระบวนการแบ่งชุด
+st.subheader("🎙️ ระบบแปลงและดาวน์โหลดทีละชุด (Auto-Rename)")
+if st.button("🚀 เริ่มต้นแปลงนิยายแบบแบ่งชุดอัตโนมัติ"):
     if start_url.strip() == "":
         st.warning("⚠️ กรุณากรอกลิงก์เริ่มต้นก่อนครับ")
     elif end_ep < start_ep:
         st.warning("⚠️ ตอนสิ้นสุดต้องมากกว่าหรือเท่ากับตอนเริ่มต้นครับ")
     else:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        total_episodes = (end_ep - start_ep) + 1
+        num_batches = (total_episodes + batch_size - 1) // batch_size
         
-        all_chapter_texts = []
-        temp_chapter_audio_files = []
+        st.info(f"ℹ️ ระบบจะทำการแบ่งตอนทั้งหมด {total_episodes} ตอน ออกเป็น **{num_batches} ชุด** (ชุดละประมาณ {batch_size} ตอน)")
+        
+        overall_progress = st.progress(0)
+        status_display = st.empty()
+        
         current_url = start_url
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
-        total_steps = (end_ep - start_ep) + 1
-        success_count = 0
-        start_time = time.time()
+        global_start_time = time.time()
+        completed_episodes_count = 0
         
-        for i in range(total_steps):
-            actual_ep_num = start_ep + i
+        downloadable_batches = []
+        
+        for batch_idx in range(num_batches):
+            batch_start_ep = start_ep + (batch_idx * batch_size)
+            batch_end_ep = min(start_ep + ((batch_idx + 1) * batch_size) - 1, end_ep)
             
-            # คำนวณเปอร์เซ็นต์ความคืบหน้าอย่างละเอียด
-            percent_val = int(((i) / total_steps) * 90)
-            progress_bar.progress(max(percent_val, 1))
+            status_display.markdown(f"📦 **กำลังประมวลผลชุดที่ {batch_idx + 1} / {num_batches}** (ตอนที่ {batch_start_ep} ถึง {batch_end_ep})")
             
-            # คำนวณเวลาที่ใช้ไป (Timer)
-            elapsed_sec = time.time() - start_time
-            minutes = int(elapsed_sec // 60)
-            seconds = int(elapsed_sec % 60)
-            time_str = f"{minutes} นาที {seconds} วินาที" if minutes > 0 else f"{seconds} วินาที"
+            batch_chapter_texts = []
+            batch_audio_files = []
             
-            status_text.markdown(f"""
-            ⚡ **กำลังประมวลผลตอนที่ {actual_ep_num}** ({i+1}/{total_steps} ตอน) — **คืบหน้า: {percent_val}%**<br>
-            ⏱️ เวลาที่ใช้ไป: **{time_str}**
-            """, unsafe_allow_html=True)
-            
-            try:
-                # 1. ดึงเว็บ
-                res = requests.get(current_url, headers=headers, timeout=8)
-                if res.status_code != 200:
-                    break
+            current_batch_total = (batch_end_ep - batch_start_ep) + 1
+            for b_i in range(current_batch_total):
+                actual_ep_num = batch_start_ep + b_i
+                completed_episodes_count += 1
+                
+                pct = int((completed_episodes_count / total_episodes) * 100)
+                overall_progress.progress(max(min(pct, 100), 1))
+                
+                try:
+                    res = requests.get(current_url, headers=headers, timeout=8)
+                    if res.status_code != 200:
+                        break
+                        
+                    soup = BeautifulSoup(res.text, 'html.parser')
+                    paragraphs = soup.find_all('p')
+                    raw_content = "\n".join([p.get_text() for p in paragraphs])
+                    if len(raw_content.strip()) < 10:
+                        raw_content = soup.get_text()
+
+                    translated_content = fast_translate(raw_content, src_lang=src_lang, dest_lang='th')
                     
-                soup = BeautifulSoup(res.text, 'html.parser')
-                paragraphs = soup.find_all('p')
-                raw_content = "\n".join([p.get_text() for p in paragraphs])
-                if len(raw_content.strip()) < 10:
-                    raw_content = soup.get_text()
-
-                # 2. แปลภาษา
-                translated_content = fast_translate(raw_content, src_lang=src_lang, dest_lang='th')
-                
-                formatted_chapter_text = f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content
-                all_chapter_texts.append(formatted_chapter_text)
-                st.session_state.novel_text = "".join(all_chapter_texts)
-
-                # 3. แปลงเสียงเฉพาะตอนนี้แบบความเร็วสูง
-                ch_audio_file = f"turbo_ch_{actual_ep_num}.mp3"
-                temp_chapter_audio_files.append(ch_audio_file)
-                
-                asyncio.run(text_to_speech_fast(translated_content, voice_choice, ch_audio_file))
-                success_count += 1
-                
-                # 4. หาลิงก์ตอนถัดไป
-                next_link = None
-                for a in soup.find_all('a', href=True):
-                    text_a = a.get_text().lower()
-                    if 'next' in text_a or 'ถัดไป' in text_a or '>>' in text_a or '下一页' in text_a:
-                        next_link = a['href']
-                        break
-                
-                if next_link:
-                    current_url = next_link if next_link.startswith('http') else urllib.parse.urljoin(current_url, next_link)
-                else:
-                    if re.search(r'-\d+$', current_url):
-                        current_url = re.sub(r'-\d+$', lambda m: f"-{int(m.group(1)[1:])+1}", current_url)
+                    formatted_ch = f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content
+                    batch_chapter_texts.append(formatted_ch)
+                    
+                    ch_audio_file = f"batch_{batch_idx}_ch_{actual_ep_num}.mp3"
+                    batch_audio_files.append(ch_audio_file)
+                    
+                    asyncio.run(text_to_speech_fast(translated_content, voice_choice, ch_audio_file))
+                    
+                    next_link = None
+                    for a in soup.find_all('a', href=True):
+                        text_a = a.get_text().lower()
+                        if 'next' in text_a or 'ถัดไป' in text_a or '>>' in text_a or '下一页' in text_a:
+                            next_link = a['href']
+                            break
+                    
+                    if next_link:
+                        current_url = next_link if next_link.startswith('http') else urllib.parse.urljoin(current_url, next_link)
                     else:
-                        break
-            except Exception:
-                break
+                        if re.search(r'-\d+$', current_url):
+                            current_url = re.sub(r'-\d+$', lambda m: f"-{int(m.group(1)[1:])+1}", current_url)
+                        else:
+                            break
+                except Exception:
+                    break
 
-        # 5. รวมไฟล์เสียงทั้งหมดรวดเดียว
-        if temp_chapter_audio_files:
-            status_text.text("🔗 กำลังรวมไฟล์เสียงทุกตอนเข้าเป็นไฟล์หลัก...")
-            progress_bar.progress(95)
-            
-            final_output_file = "premwadee_turbo_50_episodes.mp3"
-            with open(final_output_file, "wb") as final_out:
-                for caf in temp_chapter_audio_files:
-                    if os.path.exists(caf) and os.path.getsize(caf) > 0:
-                        with open(caf, "rb") as caf_in:
-                            final_out.write(caf_in.read())
-                        os.remove(caf)
-            
-            total_elapsed = time.time() - start_time
-            tot_min = int(total_elapsed // 60)
-            tot_sec = int(total_elapsed % 60)
-            total_time_str = f"{tot_min} นาที {tot_sec} วินาที" if tot_min > 0 else f"{tot_sec} วินาที"
-            
-            progress_bar.progress(100)
-            status_text.success(f"🎉 สำเร็จ! แปลงและรวมเสียง {success_count} ตอน เรียบร้อยในเวลา {total_time_str}!")
-            
-            if os.path.exists(final_output_file):
-                with open(final_output_file, "rb") as f:
-                    audio_bytes = f.read()
+            # รวมไฟล์เสียงประจำชุด และตั้งชื่อไฟล์ตามตอนที่ทำเสร็จอัตโนมัติ (เช่น novel_ep_1_to_50.mp3)
+            if batch_audio_files:
+                batch_filename = f"novel_ep_{batch_start_ep}_to_{batch_end_ep}.mp3"
+                with open(batch_filename, "wb") as batch_out:
+                    for caf in batch_audio_files:
+                        if os.path.exists(caf) and os.path.getsize(caf) > 0:
+                            with open(caf, "rb") as caf_in:
+                                batch_out.write(caf_in.read())
+                            os.remove(caf)
                 
-                st.audio(audio_bytes, format="audio/mp3")
-                st.download_button(
-                    label="📥 ดาวน์โหลดไฟล์ MP3 (Turbo 50 ตอน)",
-                    data=audio_bytes,
-                    file_name="novel_turbo_50_episodes.mp3",
-                    mime="audio/mp3"
-                )
-        else:
-            status_text.error("❌ ไม่สามารถสร้างไฟล์เสียงได้ กรุณาตรวจสอบลิงก์เริ่มต้นอีกครั้ง")
+                if os.path.exists(batch_filename):
+                    with open(batch_filename, "rb") as bf:
+                        b_bytes = bf.read()
+                    downloadable_batches.append((f"ตอนที่ {batch_start_ep} ถึง {batch_end_ep}", b_bytes, batch_filename))
+
+            if batch_chapter_texts:
+                st.session_state.novel_text += "".join(batch_chapter_texts)
+
+        overall_progress.progress(100)
+        total_elapsed = time.time() - global_start_time
+        status_display.success(f"🎉 ประมวลผลเสร็จสิ้นทุกชุด! ใช้เวลาไปทั้งหมด {int(total_elapsed)} วินาที")
+
+        # แสดงปุ่มดาวน์โหลดแยกตามชุด พร้อมชื่อไฟล์ที่เปลี่ยนตามตอนอัตโนมัติ
+        st.markdown("---")
+        st.subheader("📥 ดาวน์โหลดไฟล์เสียงแยกตามชุด (ตั้งชื่อตามตอนอัตโนมัติ)")
+        for title, data_bytes, filename in downloadable_batches:
+            st.markdown(f"🎵 **ไฟล์: `{filename}`**")
+            st.audio(data_bytes, format="audio/mp3")
+            st.download_button(
+                label=f"📥 ดาวน์โหลด {title} ({filename})",
+                data=data_bytes,
+                file_name=filename,
+                mime="audio/mp3",
+                key=filename
+            )
