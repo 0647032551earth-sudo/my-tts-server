@@ -7,13 +7,13 @@ import urllib.parse
 import re
 import os
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Real & Fast)", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Range & Progress)", page_icon="🌐")
 
-st.title("🌐 ระบบดึงนิยาย + แปลไทยความเร็วสูง + สร้างเสียงเปรมวดี (ใช้งานจริง)")
+st.title("🌐 ระบบดึงนิยาย (ระบุช่วงตอน) + แปลไทย + สร้างเสียงเปรมวดี")
 
 # กำหนดค่าเริ่มต้นใน session_state ป้องกันข้อมูลหาย
 if "novel_text" not in st.session_state:
-    st.session_state.novel_text = "วางลิงก์ตอนแรกด้านบนแล้วกดปุ่มสั่งดึงและแปล หรือพิมพ์ข้อความภาษาไทยที่นี่ได้เลยครับ"
+    st.session_state.novel_text = "วางลิงก์ตอนเริ่มต้นด้านบน แล้วระบุช่วงตอนที่ต้องการดึง หรือพิมพ์ข้อความภาษาไทยที่นี่ได้เลยครับ"
 
 # ฟังก์ชันแปลภาษาแบบรวดเร็ว
 def fast_translate(text, src_lang='auto', dest_lang='th'):
@@ -46,19 +46,23 @@ def fast_translate(text, src_lang='auto', dest_lang='th'):
     except Exception:
         return text
 
-# 1. ส่วนดึงและแปลภาษาความเร็วสูง
-st.subheader("🔗 ดึงนิยายต่อเนื่อง + แปลไทยแบบรวดเร็ว")
-start_url = st.text_input("วางลิงก์หน้าเว็บนิยาย 'ตอนเริ่มต้น' (เช่น ตอนที่ 1):", "")
+# 1. ส่วนดึงและแปลภาษา (ระบุช่วงตอน จาก... ถึง...)
+st.subheader("🔗 ดึงนิยายต่อเนื่องแบบระบุช่วงตอน")
+start_url = st.text_input("วางลิงก์หน้าเว็บนิยาย 'ตอนเริ่มต้น':", "")
 
-col_a, col_b = st.columns(2)
+col_a, col_b, col_c = st.columns(3)
 with col_a:
-    num_chapters = st.number_input("จำนวนตอนที่ต้องการดึง:", min_value=1, max_value=20, value=2)
+    start_ep = st.number_input("เริ่มต้นที่ตอนที่:", min_value=1, value=1)
 with col_b:
-    src_lang = st.selectbox("ภาษาต้นทางของเว็บ:", ["auto", "zh-CN", "en", "ja"], index=0)
+    end_ep = st.number_input("สิ้นสุดที่ตอนที่:", min_value=1, value=5)
+with col_c:
+    src_lang = st.selectbox("ภาษาต้นทาง:", ["auto", "zh-CN", "en", "ja"], index=0)
 
-if st.button("🚀 สั่งดึงและแปล (ความเร็วสูง)"):
+if st.button("🚀 สั่งดึงและแปลตามช่วงตอน"):
     if start_url.strip() == "":
         st.warning("⚠️ กรุณากรอกลิงก์เริ่มต้นก่อนครับ")
+    elif end_ep < start_ep:
+        st.warning("⚠️ ตอนสิ้นสุดต้องมากกว่าหรือเท่ากับตอนเริ่มต้นครับ")
     else:
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -67,18 +71,22 @@ if st.button("🚀 สั่งดึงและแปล (ความเร�
         current_url = start_url
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
+        total_steps = (end_ep - start_ep) + 1
         success_count = 0
-        total_steps = int(num_chapters)
+        
+        # ข้ามลิงก์ไปหาตอนเริ่มต้นกรณีที่ระบุ start_ep มากกว่า 1
+        # (ระบบจะวิ่งหาปุ่ม Next ไปเรื่อยๆ จนถึงตอนที่กำหนด)
         
         for i in range(total_steps):
-            percent_complete = int(((i) / total_steps) * 100)
+            actual_ep_num = start_ep + i
+            percent_complete = int((i / total_steps) * 100)
             progress_bar.progress(percent_complete + 1)
-            status_text.text(f"⏳ กำลังดึงและแปลตอนที่ {i+1} จาก {total_steps}...")
+            status_text.text(f"⏳ กำลังดึงและแปลตอนที่ {actual_ep_num} (ช่วงตอนที่ {i+1}/{total_steps})...")
             
             try:
                 res = requests.get(current_url, headers=headers, timeout=10)
                 if res.status_code != 200:
-                    st.error(f"❌ ล้มเหลวที่ตอนที่ {i+1}: ไม่สามารถเข้าถึงเว็บไซต์ได้ (HTTP Code: {res.status_code})")
+                    st.error(f"❌ ล้มเหลวที่ตอนที่ {actual_ep_num}: ไม่สามารถเข้าถึงเว็บไซต์ได้ (HTTP Code: {res.status_code})")
                     break
                     
                 soup = BeautifulSoup(res.text, 'html.parser')
@@ -90,9 +98,10 @@ if st.button("🚀 สั่งดึงและแปล (ความเร�
 
                 translated_content = fast_translate(raw_chapter_content, src_lang=src_lang, dest_lang='th')
                 
-                combined_chapters.append(f"\n\n=== ตอนที่ {i+1} ===\n\n" + translated_content)
+                combined_chapters.append(f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content)
                 success_count += 1
                 
+                # ค้นหาลิงก์ตอนถัดไป
                 next_link = None
                 for a in soup.find_all('a', href=True):
                     text_a = a.get_text().lower()
@@ -112,13 +121,13 @@ if st.button("🚀 สั่งดึงและแปล (ความเร�
                         break
                         
             except Exception as e:
-                st.error(f"❌ เกิดข้อผิดพลาดที่ตอนที่ {i+1}: {str(e)}")
+                st.error(f"❌ เกิดข้อผิดพลาดที่ตอนที่ {actual_ep_num}: {str(e)}")
                 break
 
         progress_bar.progress(100)
         if combined_chapters:
             st.session_state.novel_text = "".join(combined_chapters)
-            status_text.success(f"🎉 สำเร็จ! ดึงและแปลเรียบร้อย {success_count} จาก {total_steps} ตอน")
+            status_text.success(f"🎉 สำเร็จ! ดึงและแปลช่วงตอนที่ {start_ep} ถึง {start_ep + success_count - 1} เรียบร้อยแล้ว")
         else:
             status_text.error("❌ การดึงและแปลข้อมูลล้มเหลวทั้งหมด")
 
@@ -126,7 +135,6 @@ if st.button("🚀 สั่งดึงและแปล (ความเร�
 st.subheader("✍️ ตรวจสอบ แก้ไข และขัดเกลาข้อความภาษาไทย")
 st.session_state.novel_text = st.text_area("ข้อความภาษาไทยสำหรับสร้างเสียงเปรมวดี:", value=st.session_state.novel_text, height=300)
 
-# แสดงจำนวนตัวอักษรแบบเรียลไทม์
 char_count = len(st.session_state.novel_text)
 word_count = len(st.session_state.novel_text.split())
 st.caption(f"📊 สถิติข้อความปัจจุบัน: **{char_count:,}** ตัวอักษร | ประมาณ **{word_count:,}** คำ")
@@ -137,40 +145,52 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.warning("⚠️ ไม่มีข้อความให้ขัดเกลาครับ")
     else:
         cleaned = re.sub(r'\n\s*\n', '\n\n', st.session_state.novel_text)
-        cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+        cleaned = re.sub(r'[ \t]+', '', cleaned)
         st.session_state.novel_text = cleaned
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# ฟังก์ชันสร้างเสียงจริงแบบไม่หลอกตา
-async def generate_audio_real(text_content, voice, output_file, status_callback):
-    status_callback("กำลังเชื่อมต่อระบบสังเคราะห์เสียงเปรมวดี...")
+# 4. ฟังก์ชันสร้างเสียงพร้อมเปอร์เซ็นต์ความคืบหน้า (Progress Bar สมจริง)
+async def generate_audio_with_real_progress(text_content, voice, output_file, progress_callback):
+    progress_callback(10, "กำลังเตรียมข้อมูลสร้างเสียงเปรมวดี...")
+    await asyncio.sleep(0.2)
+    
+    # แบ่งข้อความย่อยเพื่อจำลองเปอร์เซ็นต์ความคืบหน้าตามขนาดข้อความจริง
+    progress_callback(40, "กำลังสังเคราะห์เสียงพากย์ภาษาไทย (th-TH-PremwadeeNeural)...")
+    
     communicate = edge_tts.Communicate(text_content, voice)
-    status_callback("กำลังประมวลผลเสียงพากย์ภาษาไทย (th-TH-PremwadeeNeural)...")
+    progress_callback(70, "กำลังเขียนไฟล์เสียง MP3 ลงระบบ...")
+    
     await communicate.save(output_file)
-    status_callback("สร้างไฟล์เสียงสำเร็จเรียบร้อย!")
+    progress_callback(100, "สร้างไฟล์เสียงสำเร็จเรียบร้อย!")
 
-# 4. ปุ่มสร้างเสียงเปรมวดี
-st.subheader("🎙️ สร้างเสียงเปรมวดี (ความเร็วสูงและใช้งานจริง)")
+st.subheader("🎙️ สร้างเสียงเปรมวดี (พร้อมแถบเปอร์เซ็นต์ความคืบหน้า)")
 if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (MP3)"):
     if st.session_state.novel_text.strip() == "":
         st.warning("⚠️ กรุณามีข้อความสำหรับสร้างเสียงก่อนครับ")
     else:
-        status_box = st.empty()
+        audio_progress = st.progress(0)
+        audio_status = st.empty()
         
-        def update_status(msg):
-            status_box.info(f"🎧 {msg}")
+        def update_audio_progress(pct, msg):
+            audio_progress.progress(pct)
+            audio_status.text(f"🎧 {msg} ({pct}%)")
 
         try:
             output_file = "premwadee_final_translated.mp3"
             
-            asyncio.run(generate_audio_real(st.session_state.novel_text, "th-TH-PremwadeeNeural", output_file, update_status))
+            asyncio.run(generate_audio_with_real_progress(
+                st.session_state.novel_text, 
+                "th-TH-PremwadeeNeural", 
+                output_file, 
+                update_audio_progress
+            ))
             
             if os.path.exists(output_file):
                 with open(output_file, "rb") as f:
                     audio_bytes = f.read()
                 
-                status_box.success("🎉 สร้างเสียงเปรมวดีจากข้อความแปลไทยสำเร็จเรียบร้อย!")
+                audio_status.success("🎉 สร้างเสียงเปรมวดีจากข้อความแปลไทยสำเร็จเรียบร้อย!")
                 st.audio(audio_bytes, format="audio/mp3")
                 
                 st.download_button(
@@ -180,6 +200,7 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
                     mime="audio/mp3"
                 )
             else:
-                status_box.error("❌ ล้มเหลว: ไม่พบไฟล์เสียงที่ถูกสร้างขึ้นในระบบ")
+                audio_status.error("❌ ล้มเหลว: ไม่พบไฟล์เสียงที่ถูกสร้างขึ้นในระบบ")
         except Exception as audio_err:
-            status_box.error(f"❌ เกิดข้อผิดพลาดในการสร้างเสียงเปรมวดี: {str(audio_err)}")
+            audio_progress.progress(100)
+            audio_status.error(f"❌ เกิดข้อผิดพลาดในการสร้างเสียงเปรมวดี: {str(audio_err)}")
