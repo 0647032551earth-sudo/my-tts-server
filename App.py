@@ -8,9 +8,9 @@ import re
 import os
 import time
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Adaptive Turbo", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - แยกตอนรวมไฟล์เดียว", page_icon="🌐")
 
-st.title("🌐 ระบบดึงนิยาย + แปลไทย + สร้างเสียงเปรมวดี (Adaptive Turbo & Auto-Scaling)")
+st.title("🌐 ระบบดึงนิยาย + แปลไทย + สร้างเสียง (แปลงทีละตอนแล้วรวมเป็นไฟล์เดียว)")
 
 if "novel_text" not in st.session_state:
     st.session_state.novel_text = "วางลิงก์ตอนเริ่มต้นด้านบน แล้วระบุช่วงตอนที่ต้องการดึง หรือพิมพ์ข้อความภาษาไทยที่นี่ได้เลยครับ"
@@ -127,96 +127,90 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
     st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
     st.rerun()
 
-# ฟังก์ชันสร้างเสียงพร้อมระบบ Adaptive Speed (ปรับความเร็วอัตโนมัติตามสภาพเน็ต/เซิร์ฟเวอร์)
-async def generate_audio_adaptive(text_content, voice, output_filename, progress_bar, status_text):
-    clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text_content)
+# ฟังก์ชันแปลงเสียงทีละตอน แล้วนำมารวมเป็นไฟล์เดียว
+async def generate_audio_by_chapter(text_content, voice, output_filename, progress_bar, status_text):
+    # แยกข้อความตามรูปแบบตอน เช่น "=== ตอนที่ X ==="
+    chapters = re.split(r'(===\s*ตอนที่\s*\d+\s*===)', text_content)
     
-    # กำหนดขนาดก้อนข้อความให้อยู่ในช่วง 2,000 ตัวอักษร (ตามที่ขอ 1,500 - 2,500)
-    chunk_size = 2000
-    text_chunks = [clean_text[i:i+chunk_size] for i in range(0, len(clean_text), chunk_size)]
-    text_chunks = [c.strip() for c in text_chunks if c.strip()]
+    chapter_blocks = []
+    current_title = "ตอนที่ 1"
     
-    total_chunks = len(text_chunks)
-    total_chars = len(clean_text)
-    
-    if total_chunks == 0:
+    for part in chapters:
+        if "=== ตอนที่" in part:
+            current_title = part.strip()
+        elif part.strip():
+            chapter_blocks.append((current_title, part.strip()))
+            
+    # ถ้าไม่มีหัวข้อตอน ให้แบ่งด้วยขนาดตัวอักษรปกติ (ประมาณ 2,000 ตัวอักษรต่อส่วน) แทน
+    if not chapter_blocks:
+        chunk_size = 2000
+        chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+        chapter_blocks = [(f"ส่วนที่ {idx+1}", c.strip()) for idx, c in enumerate(chunks) if c.strip()]
+
+    total_chapters = len(chapter_blocks)
+    if total_chapters == 0:
         return False
 
-    temp_files = [f"temp_part_{idx}.mp3" for idx in range(total_chunks)]
+    temp_chapter_files = []
     
-    async def process_chunk(idx, chunk):
-        for attempt in range(2):
-            try:
-                communicate = edge_tts.Communicate(chunk, voice)
-                await communicate.save(temp_files[idx])
-                return True
-            except Exception:
-                await asyncio.sleep(0.3)
+    for idx, (ch_title, ch_text) in enumerate(chapter_blocks):
+        current_pct = int(((idx) / total_chapters) * 100)
+        progress_bar.progress(current_pct)
+        status_text.text(f"🎙️ กำลังแปลงเสียง: {ch_title} ({idx + 1}/{total_chapters})")
         
-        with open(temp_files[idx], "wb") as f:
-            f.write(b"")
-        return False
+        # ซอยย่อยภายในตอนนั้นๆ เป็นก้อนละ 2,000 ตัวอักษร เพื่อแปลงให้รวดเร็วและปลอดภัย
+        sub_chunk_size = 2000
+        sub_chunks = [ch_text[i:i+sub_chunk_size] for i in range(0, len(ch_text), sub_chunk_size)]
+        
+        sub_files = []
+        for s_idx, s_text in enumerate(sub_chunks):
+            sub_file = f"temp_ch_{idx}_sub_{s_idx}.mp3"
+            sub_files.append(sub_file)
+            
+            # ระบบลองใหม่ (Retry) อัตโนมัติถ้าเกิดข้อผิดพลาด
+            success_sub = False
+            for attempt in range(2):
+                try:
+                    clean_s_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', s_text)
+                    communicate = edge_tts.Communicate(clean_s_text, voice)
+                    await communicate.save(sub_file)
+                    success_sub = True
+                    break
+                except Exception:
+                    await asyncio.sleep(0.3)
+            
+            if not success_sub:
+                with open(sub_file, "wb") as f:
+                    f.write(b"")
 
-    # ระบบปรับความเร็วอัตโนมัติ (เริ่มต้นที่ 6 ตัวตามขอ)
-    current_batch_size = 6
-    completed_count = 0
-    processed_chars = 0
-    start_time = time.time()
-    
-    i = 0
-    while i < total_chunks:
-        batch_indices = range(i, min(i + current_batch_size, total_chunks))
-        batch_start_time = time.time()
+        # รวมย่อยแต่ละส่วนของตอนนี้ให้เป็นไฟล์ของตอนนี้
+        chapter_file = f"temp_chapter_{idx}.mp3"
+        temp_chapter_files.append(chapter_file)
         
-        batch_tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
-        await asyncio.gather(*batch_tasks)
-        
-        batch_duration = time.time() - batch_start_time
-        
-        # เช็คความเร็ว ถ้ากลุ่มนี้ทำเสร็จไวมาก (เช่น น้อยกว่า 1.5 วินาที) แปลว่าระบบไหว เร่งความเร็วขึ้น (สูงสุด 12 ตัว)
-        if batch_duration < 1.5 and current_batch_size < 12:
-            current_batch_size += 2
-        # ถ้าเริ่มช้าหรือติดขัด (มากกว่า 4 วินาที) แปลว่าเริ่มหนัก ลดความเร็วลงทีละนิด (ต่ำสุด 2 ตัว)
-        elif batch_duration > 4.0 and current_batch_size > 2:
-            current_batch_size = max(2, current_batch_size - 2)
+        with open(chapter_file, "wb") as ch_out:
+            for sf in sub_files:
+                if os.path.exists(sf) and os.path.getsize(sf) > 0:
+                    with open(sf, "rb") as sf_in:
+                        ch_out.write(sf_in.read())
+                    os.remove(sf)
 
-        completed_count += len(batch_indices)
-        for idx in batch_indices:
-            processed_chars += len(text_chunks[idx])
-        
-        elapsed_time = max(time.time() - start_time, 0.1)
-        chars_per_sec = processed_chars / elapsed_time
-        remaining_chars = total_chars - processed_chars
-        eta_seconds = remaining_chars / chars_per_sec if chars_per_sec > 0 else 0
-        current_pct = int((completed_count / total_chunks) * 100)
-        
-        progress_bar.progress(min(current_pct, 100))
-        status_text.markdown(f"""
-        ⚡ **[Adaptive Turbo] กำลังสังเคราะห์เสียงเปรมวดี...** ({current_pct}%)<br>
-        ⚙️ ความเร็วรอบปัจจุบัน: ประมวลผลทีละ **{len(batch_indices)} ก้อน** (ปรับออโต้: {current_batch_size} ก้อน)<br>
-        ⏱️ ทำงานไปแล้ว: **{elapsed_time:.1f} วินาที** | 🚀 ความเร็ว: **{chars_per_sec:.1f} ตัวอักษร/วินาที**<br>
-        ⏳ จะเสร็จในอีกประมาณ: **{eta_seconds:.1f} วินาที** (เหลืออีก {max(remaining_chars, 0):,} ตัวอักษร)
-        """, unsafe_allow_html=True)
-        
-        i += len(batch_indices)
-
-    status_text.text("🔗 กำลังรวมไฟล์เสียงทั้งหมดเข้าด้วยกัน...")
+    # รวมไฟล์ทุกตอนเข้าเป็นไฟล์เสียงหลักไฟล์เดียว
+    status_text.text("🔗 กำลังรวมไฟล์เสียงทุกตอนเข้าเป็นไฟล์หลัก...")
     progress_bar.progress(95)
     
-    with open(output_filename, "wb") as outfile:
-        for f in temp_files:
-            if os.path.exists(f) and os.path.getsize(f) > 0:
-                with open(f, "rb") as infile:
-                    outfile.write(infile.read())
-                os.remove(f)
+    with open(output_filename, "wb") as final_out:
+        for cf in temp_chapter_files:
+            if os.path.exists(cf) and os.path.getsize(cf) > 0:
+                with open(cf, "rb") as cf_in:
+                    final_out.write(cf_in.read())
+                os.remove(cf)
 
-    total_duration = time.time() - start_time
     progress_bar.progress(100)
-    status_text.success(f"🎉 สร้างไฟล์เสียงสำเร็จ 100%! (ใช้เวลาทั้งหมด {total_duration:.1f} วินาที)")
+    status_text.success("🎉 สร้างและรวมไฟล์เสียงทุกตอนสำเร็จเรียบร้อยแล้ว!")
     return True
 
-st.subheader("🎙️ สร้างเสียงเปรมวดี (Adaptive Turbo & Auto-Scaling)")
-if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (Adaptive MP3)"):
+st.subheader("🎙️ สร้างเสียงเปรมวดี (แปลงทีละตอนรวมเป็นไฟล์เดียว)")
+if st.button("🎙️ เริ่มแปลงทีละตอนและรวมไฟล์ (MP3)"):
     if st.session_state.novel_text.strip() == "":
         st.warning("⚠️ กรุณามีข้อความสำหรับสร้างเสียงก่อนครับ")
     else:
@@ -224,8 +218,8 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
         audio_status = st.empty()
 
         try:
-            output_file = "premwadee_final_translated.mp3"
-            success = asyncio.run(generate_audio_adaptive(
+            output_file = "premwadee_all_chapters_combined.mp3"
+            success = asyncio.run(generate_audio_by_chapter(
                 st.session_state.novel_text, 
                 "th-TH-PremwadeeNeural", 
                 output_file, 
@@ -239,9 +233,9 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
                 
                 st.audio(audio_bytes, format="audio/mp3")
                 st.download_button(
-                    label="📥 ดาวน์โหลดไฟล์ MP3 เสียงเปรมวดี (Adaptive)",
+                    label="📥 ดาวน์โหลดไฟล์ MP3 รวมทุกตอน",
                     data=audio_bytes,
-                    file_name="premwadee_novel.mp3",
+                    file_name="novel_combined_audio.mp3",
                     mime="audio/mp3"
                 )
         except Exception as e:
