@@ -2,4 +2,4 @@ streamlit
 edge-tts
 requests
 beautifulsoup4
-deep-translator
+googletrans==4.0.0-rc1
