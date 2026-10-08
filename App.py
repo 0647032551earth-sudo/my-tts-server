@@ -48,7 +48,7 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_VERSION = "V7.3"
+APP_VERSION = "V7.4"
 VOICE = "th-TH-PremwadeeNeural"
 
 BASE_DIR = Path(__file__).resolve().parent / "novel_audio_jobs"
@@ -1750,6 +1750,7 @@ if job_id:
     outputs = state.get("set_outputs", {})
 
     if outputs:
+        st.success("ไฟล์ของชุดที่เสร็จแล้วถูกเก็บไว้ใน Job นี้ และจะกลับมาแสดงอีกครั้งเมื่อรีเฟรชหน้า")
         for set_no in sorted(
             outputs.keys(),
             key=lambda x: int(x),
@@ -1772,7 +1773,7 @@ if job_id:
                     with zip_path.open("rb") as f:
                         st.download_button(
                             "⬇️ ดาวน์โหลด ZIP",
-                            data=f.read(),
+                            data=f,
                             file_name=zip_path.name,
                             mime="application/zip",
                             key=f"zip_{job_id}_{set_no}",
@@ -1784,7 +1785,7 @@ if job_id:
                     with mp3_path.open("rb") as f:
                         st.download_button(
                             "🎧 ดาวน์โหลด MP3",
-                            data=f.read(),
+                            data=f,
                             file_name=mp3_path.name,
                             mime="audio/mpeg",
                             key=f"mp3_{job_id}_{set_no}",
