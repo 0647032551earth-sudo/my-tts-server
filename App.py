@@ -48,7 +48,7 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_VERSION = "V7.4"
+APP_VERSION = "V8.2"
 VOICE = "th-TH-PremwadeeNeural"
 
 BASE_DIR = Path(__file__).resolve().parent / "novel_audio_jobs"
@@ -56,7 +56,12 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 FETCH_WORKERS = 6
 TRANSLATE_WORKERS = 4
-TTS_WORKERS = 6
+TTS_WORKERS = 3
+# Edge TTS can intermittently return an empty audio stream when several
+# websocket jobs hit the service at once. Keep the executor at 3 for throughput
+# but cap active Edge TTS requests to 2 and retry transient empty-audio failures.
+TTS_ACTIVE_LIMIT = 2
+TTS_RETRIES = 5
 
 MAX_RETRIES = 4
 REQUEST_TIMEOUT = 25
@@ -64,6 +69,8 @@ TRANSLATE_TIMEOUT = 45
 
 MIN_TEXT_CHARS = 80
 MIN_MP3_BYTES = 1500
+TTS_CHUNK_MAX_CHARS = 4500
+MIN_CHUNK_DURATION_SECONDS = 0.05
 
 # Google Translate unofficial endpoint. It may change/rate-limit.
 TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
@@ -83,6 +90,7 @@ JOB_THREADS_LOCK = threading.Lock()
 
 CHECKPOINT_LOCKS = {}
 CHECKPOINT_LOCKS_LOCK = threading.Lock()
+TTS_ACTIVE_SEMAPHORE = threading.BoundedSemaphore(TTS_ACTIVE_LIMIT)
 
 
 def get_job_lock(job_id: str) -> threading.Lock:
@@ -503,13 +511,62 @@ def translate_text(text: str) -> str:
 # ============================================================
 
 def run_tts_sync(text: str, output_path: Path):
+    """Generate one MP3 with bounded Edge TTS concurrency and self-healing.
+
+    Edge TTS can occasionally close the websocket without returning any audio.
+    Treat that as a transient TTS failure: remove the partial file, wait with
+    jitter, and create a fresh request. This prevents a bad partial MP3 from
+    being mistaken for a successful cache.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not text or len(text.strip()) < 2:
+        raise RuntimeError("ข้อความสำหรับ TTS ว่างหรือสั้นเกินไป")
 
-    async def _run():
-        communicate = edge_tts.Communicate(text, VOICE)
-        await communicate.save(str(output_path))
+    last_error = None
 
-    asyncio.run(_run())
+    for attempt in range(1, TTS_RETRIES + 1):
+        tmp_path = output_path.with_name(
+            f"{output_path.stem}.tts-{uuid.uuid4().hex}.mp3"
+        )
+        acquired = False
+        try:
+            # Limit simultaneous Edge websocket requests.
+            TTS_ACTIVE_SEMAPHORE.acquire()
+            acquired = True
+
+            async def _run():
+                communicate = edge_tts.Communicate(text, VOICE)
+                await communicate.save(str(tmp_path))
+
+            asyncio.run(_run())
+
+            if not tmp_path.exists() or tmp_path.stat().st_size < MIN_MP3_BYTES:
+                raise RuntimeError(
+                    "No audio was received. Please verify that your parameters are correct."
+                )
+
+            # Atomically promote only a verified non-empty result.
+            os.replace(str(tmp_path), str(output_path))
+            return
+
+        except Exception as e:
+            last_error = e
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+            if attempt < TTS_RETRIES:
+                # Short jittered backoff prevents several failed workers from
+                # reconnecting to Edge TTS at exactly the same instant.
+                delay = min(1.5 * (2 ** (attempt - 1)), 12.0) + (0.15 * attempt)
+                time.sleep(delay)
+        finally:
+            if acquired:
+                TTS_ACTIVE_SEMAPHORE.release()
+
+    raise RuntimeError(f"TTS ไม่ส่งเสียงหลังลอง {TTS_RETRIES} ครั้ง: {last_error}")
 
 
 def valid_mp3(path: Path) -> bool:
@@ -555,6 +612,8 @@ def episode_paths(job_id: str, episode: int):
         "raw": root / "text_cache" / f"{episode}.txt",
         "translated": root / "translated_cache" / f"{episode}.txt",
         "mp3": root / "episode_mp3" / f"episode_{episode:06d}.mp3",
+        "tts_chunks": root / "tts_chunks" / f"episode_{episode:06d}",
+        "tts_manifest": root / "tts_chunks" / f"episode_{episode:06d}.json",
     }
 
 
@@ -818,15 +877,143 @@ def _translate_episode_stage(job_id: str, episode: int, raw_text: str):
     return translated
 
 
+def split_tts_text(text: str, max_chars: int = TTS_CHUNK_MAX_CHARS) -> list[str]:
+    """Split translated text into bounded TTS chunks without dropping text.
+
+    Prefer paragraph/sentence boundaries, then hard-split only as a last resort.
+    Every non-empty character is retained exactly once across the chunks.
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+    chunks = []
+    current = ""
+
+    def flush():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+            current = ""
+
+    for para in paragraphs:
+        if len(para) <= max_chars:
+            candidate = f"{current}\n{para}".strip() if current else para
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            flush()
+            current = para
+            continue
+
+        # Long paragraph: split on sentence-ish boundaries first.
+        sentences = [x.strip() for x in re.split(r"(?<=[.!?。！？])\s+", para) if x.strip()]
+        if not sentences:
+            sentences = [para]
+
+        for sentence in sentences:
+            if len(sentence) <= max_chars:
+                candidate = f"{current} {sentence}".strip() if current else sentence
+                if len(candidate) <= max_chars:
+                    current = candidate
+                else:
+                    flush()
+                    current = sentence
+            else:
+                flush()
+                # Last resort: hard split. No characters are discarded.
+                start = 0
+                while start < len(sentence):
+                    piece = sentence[start:start + max_chars]
+                    start += max_chars
+                    if len(piece) == max_chars:
+                        chunks.append(piece)
+                    else:
+                        current = piece
+    flush()
+    return chunks
+
+
+def _chunk_manifest_complete(manifest_path: Path, translated: str, chunk_dir: Path) -> bool:
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        chunks = data.get("chunks") or []
+        if data.get("text_hash") != hashlib.sha256(translated.encode("utf-8")).hexdigest():
+            return False
+        if data.get("chunk_count") != len(chunks) or not chunks:
+            return False
+        for item in chunks:
+            p = chunk_dir / item["file"]
+            if not valid_mp3(p):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _tts_episode_stage(job_id: str, episode: int, translated: str):
+    """Generate and verify every TTS chunk before an episode is considered done."""
     paths = episode_paths(job_id, episode)
+    chunk_dir = paths["tts_chunks"]
+    manifest = paths["tts_manifest"]
+    chunks = split_tts_text(translated)
+    if not chunks:
+        raise RuntimeError("ข้อความสำหรับ TTS ว่าง")
+
+    text_hash = hashlib.sha256(translated.encode("utf-8")).hexdigest()
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    # If a previous run has a complete manifest, trust only that verified set.
+    if _chunk_manifest_complete(manifest, translated, chunk_dir) and valid_mp3(paths["mp3"]):
+        return paths["mp3"]
+
+    # Build/repair every chunk. A missing/invalid chunk is regenerated; valid
+    # chunks are retained so a retry does not redo successful work.
+    chunk_items = []
+    for idx, chunk_text in enumerate(chunks, start=1):
+        filename = f"chunk_{idx:05d}.mp3"
+        out = chunk_dir / filename
+        if not valid_mp3(out):
+            if out.exists():
+                try: out.unlink()
+                except Exception: pass
+            run_tts_sync(chunk_text, out)
+        if not valid_mp3(out):
+            raise RuntimeError(f"TTS chunk {idx}/{len(chunks)} ไม่ผ่านการตรวจสอบ")
+        chunk_items.append({
+            "index": idx,
+            "file": filename,
+            "chars": len(chunk_text),
+        })
+
+    # Write the manifest only after EVERY chunk has passed validation.
+    manifest_data = {
+        "episode": episode,
+        "text_hash": text_hash,
+        "chunk_count": len(chunk_items),
+        "total_chars": len(translated),
+        "chunks": chunk_items,
+        "verified_at": now_ts(),
+    }
+    atomic_write_json(manifest, manifest_data)
+
+    # Remove any previous final episode MP3 before rebuilding it from the full,
+    # verified chunk list. This prevents an old partial MP3 from surviving.
+    if paths["mp3"].exists():
+        try: paths["mp3"].unlink()
+        except Exception: pass
+
+    merge_mp3s([chunk_dir / x["file"] for x in chunk_items], paths["mp3"])
     if not valid_mp3(paths["mp3"]):
-        if paths["mp3"].exists():
-            try: paths["mp3"].unlink()
-            except Exception: pass
-        run_tts_sync(translated, paths["mp3"])
-    if not valid_mp3(paths["mp3"]):
-        raise RuntimeError("MP3 ตรวจสอบแล้วไม่ผ่าน")
+        raise RuntimeError("MP3 ตอนสุดท้ายไม่ผ่านการตรวจสอบหลังรวมทุก chunk")
+
+    # Final guard: manifest must still describe the exact translated text and
+    # every chunk must still exist before returning success.
+    if not _chunk_manifest_complete(manifest, translated, chunk_dir):
+        raise RuntimeError("ตรวจสอบความครบของเสียงตอนนี้ไม่ผ่าน")
     return paths["mp3"]
 
 
