@@ -7,9 +7,9 @@ import urllib.parse
 import re
 import os
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Real Progress)", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Fast Real Progress)", page_icon="🌐")
 
-st.title("🌐 ระบบดึงนิยาย (ระบุช่วงตอน) + แปลไทย + สร้างเสียงเปรมวดี (เปอร์เซ็นต์จริง)")
+st.title("🌐 ระบบดึงนิยาย (ระบุช่วงตอน) + แปลไทย + สร้างเสียงเปรมวดี (เร่งความเร็ว + เปอร์เซ็นต์จริง)")
 
 # กำหนดค่าเริ่มต้นใน session_state ป้องกันข้อมูลหาย
 if "novel_text" not in st.session_state:
@@ -146,30 +146,42 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# 4. ฟังก์ชันสร้างเสียงแบบซอยย่อย คำนวณเปอร์เซ็นต์ความคืบหน้าตามจริง (Real Progress)
-async def generate_audio_chunks(text_content, voice, output_filename, progress_bar, status_text):
-    # ตัดแบ่งข้อความออกเป็นท่อนย่อยๆ (ประมาณ 1,500 ตัวอักษรต่อท่อน เพื่อวัดเปอร์เซ็นต์จริง)
-    chunk_size = 1500
+# 4. ฟังก์ชันสร้างเสียงแบบคู่ขนาน (รวดเร็วขึ้น + ได้เปอร์เซ็นต์จริง)
+async def generate_audio_chunks_fast(text_content, voice, output_filename, progress_bar, status_text):
+    # ขยายขนาดท่อนเป็น 3,000 ตัวอักษรต่อท่อน เพื่อลดจำนวนครั้งในการวนลูป
+    chunk_size = 3000
     text_chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
     total_chunks = len(text_chunks)
     
     if total_chunks == 0:
         return False
 
-    temp_files = []
-    for idx, chunk in enumerate(text_chunks):
-        # คำนวณเปอร์เซ็นต์ตามจำนวนท่อนที่ทำเสร็จจริง
-        current_pct = int(((idx) / total_chunks) * 100)
-        progress_bar.progress(max(current_pct, 1))
-        status_text.text(f"🎧 กำลังสังเคราะห์เสียงท่อนที่ {idx+1} จาก {total_chunks} ({current_pct}%)...")
-        
-        temp_file = f"temp_part_{idx}.mp3"
-        temp_files.append(temp_file)
-        
+    temp_files = [f"temp_part_{idx}.mp3" for idx in range(total_chunks)]
+    
+    # ฟังก์ชันช่วยแปลงทีละท่อน
+    async def process_chunk(idx, chunk):
         communicate = edge_tts.Communicate(chunk, voice)
-        await communicate.save(temp_file)
+        await communicate.save(temp_files[idx])
 
-    # รวมไฟล์ MP3 ย่อยทั้งหมดเข้าด้วยกันเป็นไฟล์เดียว
+    # แบ่งงานทำเป็นกลุ่ม (ครั้งละ 4 ท่อนพร้อมกัน) เพื่อความเร็วสูงสุด
+    batch_size = 4
+    completed_count = 0
+    
+    for i in range(0, total_chunks, batch_size):
+        batch_indices = range(i, min(i + batch_size, total_chunks))
+        
+        # อัปเดตสถานะและเปอร์เซ็นต์ตามความคืบหน้าจริง
+        current_pct = int((completed_count / total_chunks) * 100)
+        progress_bar.progress(max(current_pct, 1))
+        status_text.text(f"🎧 กำลังสังเคราะห์เสียงกลุ่มท่อนที่ {i+1} ถึง {min(i+batch_size, total_chunks)} จาก {total_chunks} ({current_pct}%)...")
+        
+        # สั่งรันพร้อมกันในกลุ่ม
+        tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
+        await asyncio.gather(*tasks)
+        
+        completed_count += len(batch_indices)
+
+    # รวมไฟล์ MP3 ย่อยทั้งหมดเข้าด้วยกัน
     status_text.text("🔗 กำลังรวมไฟล์เสียงทั้งหมดเข้าด้วยกัน...")
     progress_bar.progress(95)
     
@@ -184,7 +196,7 @@ async def generate_audio_chunks(text_content, voice, output_filename, progress_b
     status_text.text("🎉 สร้างไฟล์เสียงสำเร็จ 100%!")
     return True
 
-st.subheader("🎙️ สร้างเสียงเปรมวดี (เปอร์เซ็นต์จริงตามจำนวนข้อมูล)")
+st.subheader("🎙️ สร้างเสียงเปรมวดี (เร่งความเร็ว + เปอร์เซ็นต์จริง)")
 if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (MP3)"):
     if st.session_state.novel_text.strip() == "":
         st.warning("⚠️ กรุณามีข้อความสำหรับสร้างเสียงก่อนครับ")
@@ -195,8 +207,8 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
         try:
             output_file = "premwadee_final_translated.mp3"
             
-            # รันฟังก์ชันสร้างเสียงแบบแบ่งท่อนวัดผลจริงผ่าน asyncio
-            success = asyncio.run(generate_audio_chunks(
+            # รันฟังก์ชันสร้างเสียงแบบกลุ่มคู่ขนานผ่าน asyncio
+            success = asyncio.run(generate_audio_chunks_fast(
                 st.session_state.novel_text, 
                 "th-TH-PremwadeeNeural", 
                 output_file, 
