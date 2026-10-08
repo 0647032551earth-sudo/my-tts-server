@@ -19,7 +19,7 @@
 #   ffmpeg must be installed and available in PATH
 #
 # Run:
-#   streamlit run novel_audio_factory_v6.py
+#   streamlit run novel_audio_factory_v7.py
 
 import asyncio
 import hashlib
@@ -50,7 +50,7 @@ import edge_tts
 APP_VERSION = "V7.0"
 VOICE = "th-TH-PremwadeeNeural"
 
-BASE_DIR = Path("novel_audio_jobs")
+BASE_DIR = Path(__file__).resolve().parent / "novel_audio_jobs"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 FETCH_WORKERS = 6
@@ -1357,7 +1357,7 @@ def start_job_thread(job_id: str):
 # ============================================================
 
 st.set_page_config(
-    page_title="NOVEL AUDIO FACTORY V6",
+    page_title="NOVEL AUDIO FACTORY V7 UNIVERSAL",
     page_icon="🎧",
     layout="wide",
 )
@@ -1496,6 +1496,17 @@ if start_button:
             s["error"] = None
 
         update_state(job_id, mark_running)
+        # Verify the checkpoint exists before the UI reruns. This prevents
+        # a transient "job not found" screen on slow filesystems.
+        if not (job_dir(job_id) / "state.json").exists():
+            ensure_state(
+                job_id,
+                url.strip(),
+                int(start_episode),
+                int(end_episode),
+                int(episodes_per_set),
+            )
+            update_state(job_id, mark_running)
         st.session_state["job_id"] = job_id
         start_job_thread(job_id)
         st.rerun()
@@ -1523,8 +1534,23 @@ if job_id:
     state = read_state(job_id)
 
     if not state:
-        st.error("ไม่พบข้อมูล job")
-        st.stop()
+        # The Streamlit session can outlive the local state file after a
+        # process restart/redeploy. Recreate the state instead of showing
+        # a dead "job not found" screen.
+        if url.strip() and end_episode >= start_episode:
+            ensure_state(
+                job_id,
+                url.strip(),
+                int(start_episode),
+                int(end_episode),
+                int(episodes_per_set),
+            )
+            state = read_state(job_id)
+
+        if not state:
+            st.error("ไม่พบข้อมูล job และไม่สามารถกู้สถานะงานได้")
+            st.session_state.pop("job_id", None)
+            st.stop()
 
     # Keep worker alive across Streamlit reruns.
     if state.get("status") == "running":
