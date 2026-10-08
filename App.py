@@ -3,13 +3,37 @@ import asyncio
 import edge_tts
 import requests
 from bs4 import BeautifulSoup
-from googletrans import Translator
+import urllib.parse
+import json
 import re
 import os
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Real Translation)", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro", page_icon="🌐")
 
 st.title("🌐 ระบบดึงนิยาย + แปลภาษาไทยจริง + สร้างเสียงเปรมวดีอัจฉริยะ")
+
+# ฟังก์ชันแปลภาษาผ่าน Google Translate API แบบเบา (ไม่ต้องพึ่งไลบรารีภายนอกที่ชอบติดปัญหา Module cgi)
+def translate_text_deep(text, src_lang='auto', dest_lang='th'):
+    if not text.strip():
+        return text
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx",
+            "sl": src_lang,
+            "tl": dest_lang,
+            "dt": "t",
+            "q": text
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, params=params, headers=headers, timeout=5)
+        if response.status_code == 200:
+            res_json = response.json()
+            translated_sentence = "".join([item[0] for item in res_json[0] if item[0]])
+            return translated_sentence
+    except Exception:
+        pass
+    return text  # หากแปลไม่ผ่าน คืนค่าข้อความเดิมเพื่อป้องกันแอปพัง
 
 # 1. ส่วนดึงและแปลภาษาจริง พร้อม Progress Bar และ Error Handling
 st.subheader("🔗 ดึงนิยายต่อเนื่อง + แปลเป็นไทยจริงๆ (พร้อมสถานะเปอร์เซ็นต์)")
@@ -32,7 +56,6 @@ if st.button("🚀 สั่งดึงและแปลภาษาไทย�
         combined_chapters = []
         current_url = start_url
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        translator = Translator()
         
         success_count = 0
         total_steps = int(num_chapters)
@@ -45,7 +68,7 @@ if st.button("🚀 สั่งดึงและแปลภาษาไทย�
             try:
                 res = requests.get(current_url, headers=headers, timeout=10)
                 if res.status_code != 200:
-                    st.error(f"❌ ล้มเหลวที่ตอนที่ {i+1}: ไม่สามารถเข้าถึงเว็บไซต์ได้ (HTTP Code: {res.status_code}) ลิงก์: {current_url}")
+                    st.error(f"❌ ล้มเหลวที่ตอนที่ {i+1}: ไม่สามารถเข้าถึงเว็บไซต์ได้ (HTTP Code: {res.status_code})")
                     break
                     
                 soup = BeautifulSoup(res.text, 'html.parser')
@@ -55,19 +78,16 @@ if st.button("🚀 สั่งดึงและแปลภาษาไทย�
                 if len(raw_chapter_content.strip()) < 20:
                     st.warning(f"⚠️ คำเตือนตอนที่ {i+1}: เนื้อหาน้อยเกินไปหรือเว็บอาจบล็อกการดึงข้อมูล")
                 
-                # แปลภาษาเป็นไทยจริง (ตัดแบ่งข้อความเพื่อความเสถียรในการแปล)
+                # แปลภาษาเป็นไทยจริงทีละย่อหน้าเพื่อความแม่นยำสูง
                 paragraphs_list = raw_chapter_content.split('\n')
                 translated_paragraphs = []
                 
                 for para in paragraphs_list:
                     if para.strip():
-                        try:
-                            # สั่งแปลเป็นภาษาไทย (dest='th')
-                            translated = translator.translate(para, src=src_lang, dest='th')
-                            translated_paragraphs.append(translated.text)
-                        except Exception as t_err:
-                            # หากบรรทัดไหนแปลไม่ผ่าน ให้คงข้อความเดิมไว้และแจ้งเตือนเบาๆ
-                            translated_paragraphs.append(para)
+                        # แบ่งย่อยข้อความยาวๆ เพื่อความเสถียรในการแปล
+                        chunks = [para[j:j+400] for j in range(0, len(para), 400)]
+                        translated_chunks = [translate_text_deep(chunk, src_lang=src_lang, dest_lang='th') for chunk in chunks]
+                        translated_paragraphs.append("".join(translated_chunks))
                     else:
                         translated_paragraphs.append("")
                 
@@ -87,8 +107,7 @@ if st.button("🚀 สั่งดึงและแปลภาษาไทย�
                     if next_link.startswith('http'):
                         current_url = next_link
                     else:
-                        from urllib.parse import urljoin
-                        current_url = urljoin(current_url, next_link)
+                        current_url = urllib.parse.urljoin(current_url, next_link)
                 else:
                     if re.search(r'-\d+$', current_url):
                         current_url = re.sub(r'-\d+$', lambda m: f"-{int(m.group(1)[1:])+1}", current_url)
@@ -99,7 +118,7 @@ if st.button("🚀 สั่งดึงและแปลภาษาไทย�
                 st.error(f"❌ ล้มเหลวที่ตอนที่ {i+1}: การเชื่อมต่อหมดเวลา (Timeout)")
                 break
             except requests.exceptions.ConnectionError:
-                st.error(f"❌ ล้มเหลวที่ตอนที่ {i+1}: ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้ (Connection Error)")
+                st.error(f"❌ ล้มเหลวที่ตอนที่ {i+1}: ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้")
                 break
             except Exception as e:
                 st.error(f"❌ เกิดข้อผิดพลาดที่ตอนที่ {i+1}: {str(e)}")
@@ -108,7 +127,7 @@ if st.button("🚀 สั่งดึงและแปลภาษาไทย�
         progress_bar.progress(100)
         if combined_chapters:
             fetched_text = "".join(combined_chapters)
-            status_text.success(f"🎉 สำเร็จ! ดึงและแปลภาษาไทยจริงเรียบร้อย {success_count} จาก {total_steps} ตอน (100%)")
+            status_text.success(f"🎉 สำเร็จ! ดึงและแปลภาษาไทยเรียบร้อย {success_count} จาก {total_steps} ตอน (100%)")
         else:
             status_text.error("❌ การดึงและแปลข้อมูลล้มเหลวทั้งหมด")
 
