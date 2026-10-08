@@ -47,7 +47,7 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_VERSION = "V6"
+APP_VERSION = "V6.1"
 VOICE = "th-TH-PremwadeeNeural"
 
 BASE_DIR = Path("novel_audio_jobs")
@@ -546,44 +546,73 @@ def load_cached_text(path: Path) -> Optional[str]:
 # EPISODE URL DISCOVERY
 # ============================================================
 
+
+def infer_episode_number_from_url(url: str) -> Optional[int]:
+    """Detect chapter/episode number embedded in a URL."""
+    patterns = [
+        r"/chapter[-_/](\d+)",
+        r"/episode[-_/](\d+)",
+        r"/ep[-_/](\d+)",
+        r"chapter[-_](\d+)",
+        r"episode[-_](\d+)",
+        r"ep[-_](\d+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url or "", flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def jump_url_to_episode(url: str, target_episode: int) -> Optional[str]:
+    """Replace the numeric chapter/episode part of a URL."""
+    patterns = [
+        r"(/chapter[-_/])(\d+)",
+        r"(/episode[-_/])(\d+)",
+        r"(/ep[-_/])(\d+)",
+        r"(chapter[-_])(\d+)",
+        r"(episode[-_])(\d+)",
+        r"(ep[-_])(\d+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url or "", flags=re.IGNORECASE)
+        if m:
+            return url[:m.start(2)] + str(target_episode) + url[m.end(2):]
+    return None
+
+
 def discover_episode_urls(job_id: str, start_url: str, start_episode: int, end_episode: int):
     """
-    Crawl sequentially from the starting URL.
-    The crawler stores URLs by episode number.
-    It stops when it has discovered the requested final episode,
-    or when the site no longer exposes a next URL.
+    Discover only the requested range.
+
+    If the supplied URL contains a chapter number different from the requested
+    start episode, try to jump directly to that episode instead of crawling
+    every previous chapter.
     """
-
     state = read_state(job_id)
-    known = state.get("episode_urls", {})
+    known = state.get("episode_urls", {}) or {}
 
-    if str(start_episode) in known and len(known) >= (end_episode - start_episode + 1):
+    missing = [
+        ep for ep in range(start_episode, end_episode + 1)
+        if str(ep) not in known
+    ]
+    if not missing:
         return known
 
+    first_needed = missing[0]
     current_url = start_url
-    current_episode = start_episode
+
+    supplied_number = infer_episode_number_from_url(start_url)
+    if supplied_number is not None and supplied_number != first_needed:
+        jumped = jump_url_to_episode(start_url, first_needed)
+        if jumped:
+            current_url = jumped
+
+    current_episode = first_needed
     visited = set()
-
-    # If checkpoint has the last known URL, start from the first missing episode.
-    if known:
-        existing_eps = sorted(
-            int(k) for k in known.keys()
-            if str(k).isdigit()
-        )
-
-        if existing_eps:
-            last_ep = max(existing_eps)
-            if last_ep >= start_episode:
-                current_episode = last_ep + 1
-                prev_url = known.get(str(last_ep))
-                if prev_url:
-                    try:
-                        prev_html = fetch_html(prev_url)
-                        nxt = find_next_url(prev_url, prev_html)
-                        if nxt:
-                            current_url = nxt
-                    except Exception:
-                        pass
 
     while current_episode <= end_episode and current_url:
         if current_url in visited:
@@ -595,11 +624,11 @@ def discover_episode_urls(job_id: str, start_url: str, start_episode: int, end_e
         if ep_key not in known:
             known[ep_key] = current_url
 
-            def upd(s):
+            def upd(s, ep=current_episode, u=current_url):
                 s["episode_urls"] = known
                 s["last_activity_at"] = now_ts()
                 s["stage"] = "crawling"
-                s["message"] = f"พบ URL ตอนที่ {current_episode}"
+                s["message"] = f"พบ URL ตอนที่ {ep}"
 
             update_state(job_id, upd)
 
@@ -608,6 +637,14 @@ def discover_episode_urls(job_id: str, start_url: str, start_episode: int, end_e
             next_url = find_next_url(current_url, html)
         except Exception:
             next_url = None
+
+        # If the site's Next link cannot be detected, try changing the
+        # chapter number in the current URL.
+        if not next_url:
+            next_url = jump_url_to_episode(
+                current_url,
+                current_episode + 1,
+            )
 
         current_episode += 1
         current_url = next_url
@@ -1247,7 +1284,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🎧 NOVEL AUDIO FACTORY V6")
+st.title("🎧 NOVEL AUDIO FACTORY V6.1")
 st.caption(
     "Novel → Thai → Premwadee TTS → MP3 → Batch ZIP | "
     "Live Progress + ETA + Resume + Self-Healing"
@@ -1322,6 +1359,15 @@ st.write(
     f"**{total_sets} ชุด**"
 )
 
+detected_input_episode = infer_episode_number_from_url(url) if url else None
+if detected_input_episode is not None and int(start_episode) != detected_input_episode:
+    st.info(
+        f"🔎 URL นี้มีเลขตอนประมาณ **{detected_input_episode}** "
+        f"แต่คุณเลือกเริ่มที่ **{int(start_episode)}** — "
+        f"V6.1 จะพยายามกระโดดไปตอนที่ {int(start_episode)} "
+        f"โดยไม่ไล่ตั้งแต่ตอนที่ 1"
+    )
+
 start_button = st.button(
     "🚀 เริ่มสร้าง",
     type="primary",
@@ -1359,9 +1405,21 @@ if start_button:
         st.success(
             "งานนี้สร้างเสร็จแล้ว ระบบจะเปิดผลลัพธ์เดิมให้"
         )
-    else:
-        start_job_thread(job_id)
         st.session_state["job_id"] = job_id
+    else:
+        # IMPORTANT: set RUNNING before launching the thread.
+        # This removes the race where the page stayed at waiting / 0 / 0.
+        def mark_running(s):
+            s["status"] = "running"
+            s["stage"] = "starting"
+            s["message"] = "กำลังเริ่มระบบ..."
+            s["job_started_at"] = s.get("job_started_at") or now_ts()
+            s["last_activity_at"] = now_ts()
+            s["error"] = None
+
+        update_state(job_id, mark_running)
+        st.session_state["job_id"] = job_id
+        start_job_thread(job_id)
         st.rerun()
 
 
@@ -1587,4 +1645,16 @@ if job_id:
         st.rerun()
 
     elif state.get("status") == "idle":
-        st.info("กด เริ่มสร้าง เพื่อเริ่มงาน")
+        # A thread may have just been launched before Streamlit reran.
+        # If it is alive, keep polling instead of showing a false waiting state.
+        with JOB_THREADS_LOCK:
+            thread_alive = bool(
+                JOB_THREADS.get(job_id)
+                and JOB_THREADS[job_id].is_alive()
+            )
+
+        if thread_alive:
+            time.sleep(1.0)
+            st.rerun()
+        else:
+            st.info("กด เริ่มสร้าง เพื่อเริ่มงาน")
