@@ -10,7 +10,7 @@ import time
 
 st.set_page_config(page_title="Novel to Speech - Auto Rename Batch", page_icon="📦")
 
-st.title("📦 ระบบดึงนิยายแบ่งเป็นชุด + ตั้งชื่อไฟล์ตามตอนอัตโนมัติ")
+st.title("📦 ระบบดึงนิยายแบ่งเป็นชุด + ตั้งชื่อไฟล์ + ดาวน์โหลดอัตโนมัติ")
 
 if "novel_text" not in st.session_state:
     st.session_state.novel_text = "วางลิงก์ตอนเริ่มต้นด้านบน แล้วกำหนดช่วงตอนและขนาดชุดที่ต้องการได้เลยครับ"
@@ -37,7 +37,7 @@ def fast_translate(text, src_lang='auto', dest_lang='th'):
     except Exception:
         return text
 
-# ฟังก์ชันแปลงเสียงย่อยแบบขนาน (Parallel TTS)
+# ฟังก์ชันแปลงเสียงย่อยแบบขนาน (Parallel TTS) พร้อมระบบป้องกัน Error
 async def text_to_speech_fast(text, voice, output_file):
     clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
     sub_chunk_size = 2000
@@ -52,13 +52,13 @@ async def text_to_speech_fast(text, voice, output_file):
     sub_files = [f"sub_{os.getpid()}_{idx}.mp3" for idx in range(len(sub_chunks))]
     
     async def fetch_sub(s_idx, s_text):
-        for _ in range(2):
+        for _ in range(3):
             try:
                 communicate = edge_tts.Communicate(s_text, voice)
                 await communicate.save(sub_files[s_idx])
                 return
             except Exception:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
         with open(sub_files[s_idx], "wb") as f:
             f.write(b"")
 
@@ -109,9 +109,9 @@ with col_btn2:
         st.session_state.novel_text = ""
         st.rerun()
 
-# ปุ่มเริ่มกระบวนการแบ่งชุด
-st.subheader("🎙️ ระบบแปลงและดาวน์โหลดทีละชุด (Auto-Rename)")
-if st.button("🚀 เริ่มต้นแปลงนิยายแบบแบ่งชุดอัตโนมัติ"):
+# ปุ่มเริ่มกระบวนการแบ่งชุด พร้อมระบบกู้คืนตัวเองและแสดงปุ่มดาวน์โหลด
+st.subheader("🎙️ ระบบแปลงและดาวน์โหลดทีละชุด (Auto-Recovery & Download)")
+if st.button("🚀 เริ่มต้นแปลงนิยายแบบแบ่งชุดอัตโนมัติ (ยาวข้ามคืนได้)"):
     if start_url.strip() == "":
         st.warning("⚠️ กรุณากรอกลิงก์เริ่มต้นก่อนครับ")
     elif end_ep < start_ep:
@@ -150,45 +150,45 @@ if st.button("🚀 เริ่มต้นแปลงนิยายแบบ�
                 pct = int((completed_episodes_count / total_episodes) * 100)
                 overall_progress.progress(max(min(pct, 100), 1))
                 
-                try:
-                    res = requests.get(current_url, headers=headers, timeout=8)
-                    if res.status_code != 200:
-                        break
-                        
-                    soup = BeautifulSoup(res.text, 'html.parser')
-                    paragraphs = soup.find_all('p')
-                    raw_content = "\n".join([p.get_text() for p in paragraphs])
-                    if len(raw_content.strip()) < 10:
-                        raw_content = soup.get_text()
+                # ระบบป้องกัน Error ข้ามตอนอัตโนมัติหากเว็บมีปัญหา
+                for attempt in range(2):
+                    try:
+                        res = requests.get(current_url, headers=headers, timeout=10)
+                        if res.status_code == 200:
+                            soup = BeautifulSoup(res.text, 'html.parser')
+                            paragraphs = soup.find_all('p')
+                            raw_content = "\n".join([p.get_text() for p in paragraphs])
+                            if len(raw_content.strip()) < 10:
+                                raw_content = soup.get_text()
 
-                    translated_content = fast_translate(raw_content, src_lang=src_lang, dest_lang='th')
-                    
-                    formatted_ch = f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content
-                    batch_chapter_texts.append(formatted_ch)
-                    
-                    ch_audio_file = f"batch_{batch_idx}_ch_{actual_ep_num}.mp3"
-                    batch_audio_files.append(ch_audio_file)
-                    
-                    asyncio.run(text_to_speech_fast(translated_content, voice_choice, ch_audio_file))
-                    
-                    next_link = None
-                    for a in soup.find_all('a', href=True):
-                        text_a = a.get_text().lower()
-                        if 'next' in text_a or 'ถัดไป' in text_a or '>>' in text_a or '下一页' in text_a:
-                            next_link = a['href']
+                            translated_content = fast_translate(raw_content, src_lang=src_lang, dest_lang='th')
+                            
+                            formatted_ch = f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content
+                            batch_chapter_texts.append(formatted_ch)
+                            
+                            ch_audio_file = f"batch_{batch_idx}_ch_{actual_ep_num}.mp3"
+                            batch_audio_files.append(ch_audio_file)
+                            
+                            asyncio.run(text_to_speech_fast(translated_content, voice_choice, ch_audio_file))
+                            
+                            # ค้นหาลิงก์ตอนถัดไป
+                            next_link = None
+                            for a in soup.find_all('a', href=True):
+                                text_a = a.get_text().lower()
+                                if 'next' in text_a or 'ถัดไป' in text_a or '>>' in text_a or '下一页' in text_a:
+                                    next_link = a['href']
+                                    break
+                            
+                            if next_link:
+                                current_url = next_link if next_link.startswith('http') else urllib.parse.urljoin(current_url, next_link)
+                            else:
+                                if re.search(r'-\d+$', current_url):
+                                    current_url = re.sub(r'-\d+$', lambda m: f"-{int(m.group(1)[1:])+1}", current_url)
                             break
-                    
-                    if next_link:
-                        current_url = next_link if next_link.startswith('http') else urllib.parse.urljoin(current_url, next_link)
-                    else:
-                        if re.search(r'-\d+$', current_url):
-                            current_url = re.sub(r'-\d+$', lambda m: f"-{int(m.group(1)[1:])+1}", current_url)
-                        else:
-                            break
-                except Exception:
-                    break
+                    except Exception:
+                        time.sleep(1)
 
-            # รวมไฟล์เสียงประจำชุด และตั้งชื่อไฟล์ตามตอนที่ทำเสร็จอัตโนมัติ (เช่น novel_ep_1_to_50.mp3)
+            # รวมไฟล์เสียงประจำชุด และตั้งชื่อไฟล์ตามช่วงตอนจริงอัตโนมัติ
             if batch_audio_files:
                 batch_filename = f"novel_ep_{batch_start_ep}_to_{batch_end_ep}.mp3"
                 with open(batch_filename, "wb") as batch_out:
@@ -210,16 +210,20 @@ if st.button("🚀 เริ่มต้นแปลงนิยายแบบ�
         total_elapsed = time.time() - global_start_time
         status_display.success(f"🎉 ประมวลผลเสร็จสิ้นทุกชุด! ใช้เวลาไปทั้งหมด {int(total_elapsed)} วินาที")
 
-        # แสดงปุ่มดาวน์โหลดแยกตามชุด พร้อมชื่อไฟล์ที่เปลี่ยนตามตอนอัตโนมัติ
-        st.markdown("---")
-        st.subheader("📥 ดาวน์โหลดไฟล์เสียงแยกตามชุด (ตั้งชื่อตามตอนอัตโนมัติ)")
-        for title, data_bytes, filename in downloadable_batches:
-            st.markdown(f"🎵 **ไฟล์: `{filename}`**")
-            st.audio(data_bytes, format="audio/mp3")
-            st.download_button(
-                label=f"📥 ดาวน์โหลด {title} ({filename})",
-                data=data_bytes,
-                file_name=filename,
-                mime="audio/mp3",
-                key=filename
-            )
+        # 📥 บันทึกรายการไฟล์ลงใน Session State เพื่อให้ปุ่มดาวน์โหลดแสดงผลคงอยู่ตลอดไป
+        st.session_state.downloadable_batches = downloadable_batches
+
+    # 📥 แสดงส่วนปุ่มดาวน์โหลด (ดึงมาจาก Session State ป้องกันปุ่มหาย)
+if "downloadable_batches" in st.session_state and st.session_state.downloadable_batches:
+    st.markdown("---")
+    st.subheader("📥 ดาวน์โหลดไฟล์เสียงแยกตามชุด (พร้อมชื่อตอนอัตโนมัติ)")
+    for title, data_bytes, filename in st.session_state.downloadable_batches:
+        st.markdown(f"🎵 **ไฟล์: `{filename}`**")
+        st.audio(data_bytes, format="audio/mp3")
+        st.download_button(
+            label=f"📥 ดาวน์โหลด {title} ({filename})",
+            data=data_bytes,
+            file_name=filename,
+            mime="audio/mp3",
+            key=filename
+        )
