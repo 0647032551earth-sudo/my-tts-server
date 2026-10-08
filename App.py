@@ -147,7 +147,7 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# 4. ฟังก์ชันสร้างเสียง พร้อมระบบคำนวณเวลา อัตราความเร็ว และ ETA
+# 4. ฟังก์ชันสร้างเสียง พร้อมระบบคำนวณเวลา อัตราความเร็ว และ ETA (แบบเสถียรไม่ค้าง 0%)
 async def generate_audio_chunks_with_eta(text_content, voice, output_filename, progress_bar, status_text):
     chunk_size = 3000
     text_chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
@@ -171,34 +171,30 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
     for i in range(0, total_chunks, batch_size):
         batch_indices = range(i, min(i + batch_size, total_chunks))
         
-        # คำนวณเวลาที่ใช้ไป (Elapsed Time)
-        elapsed_time = time.time() - start_time
-        
-        # คำนวณความเร็ว (ตัวอักษรต่อวินาที)
-        chars_per_sec = processed_chars / elapsed_time if elapsed_time > 0 else 0
-        
-        # คำนวณเวลาที่เหลือ (ETA)
-        remaining_chars = total_chars - processed_chars
-        eta_seconds = remaining_chars / chars_per_sec if chars_per_sec > 0 else 0
-        
-        current_pct = int((completed_count / total_chunks) * 100)
-        progress_bar.progress(max(current_pct, 1))
-        
-        # อัปเดตข้อความแสดงผลแบบเรียลไทม์
-        status_text.markdown(f"""
-        🎧 **กำลังสังเคราะห์เสียงเปรมวดี...** ({current_pct}%)<br>
-        ⏱️ ทำงานไปแล้ว: **{elapsed_time:.1f} วินาที**<br>
-        ⚡ ความเร็ว: **{chars_per_sec:.1f} ตัวอักษร/วินาที**<br>
-        ⏳ จะเสร็จในอีกประมาณ: **{eta_seconds:.1f} วินาที** (เหลืออีก {remaining_chars:,} ตัวอักษร)
-        """, unsafe_allow_html=True)
-        
-        # สั่งรันพร้อมกันในกลุ่ม
+        # ประมวลผลกลุ่มนี้ก่อน เพื่อให้ได้ข้อมูลความเร็วและเวลาที่แม่นยำ
         batch_tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
         await asyncio.gather(*batch_tasks)
         
         completed_count += len(batch_indices)
         for idx in batch_indices:
             processed_chars += len(text_chunks[idx])
+        
+        # คำนวณเวลาที่ใช้ไป, อัตราความเร็ว และ ETA
+        elapsed_time = max(time.time() - start_time, 0.1)
+        chars_per_sec = processed_chars / elapsed_time
+        
+        remaining_chars = total_chars - processed_chars
+        eta_seconds = remaining_chars / chars_per_sec if chars_per_sec > 0 else 0
+        
+        current_pct = int((completed_count / total_chunks) * 100)
+        progress_bar.progress(min(current_pct, 100))
+        
+        status_text.markdown(f"""
+        🎧 **กำลังสังเคราะห์เสียงเปรมวดี...** ({current_pct}%)<br>
+        ⏱️ ทำงานไปแล้ว: **{elapsed_time:.1f} วินาที**<br>
+        ⚡ ความเร็ว: **{chars_per_sec:.1f} ตัวอักษร/วินาที**<br>
+        ⏳ จะเสร็จในอีกประมาณ: **{eta_seconds:.1f} วินาที** (เหลืออีก {max(remaining_chars, 0):,} ตัวอักษร)
+        """, unsafe_allow_html=True)
 
     # รวมไฟล์ MP3 ย่อยทั้งหมดเข้าด้วยกัน
     status_text.text("🔗 กำลังรวมไฟล์เสียงทั้งหมดเข้าด้วยกัน...")
@@ -213,7 +209,7 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
 
     total_duration = time.time() - start_time
     progress_bar.progress(100)
-    status_text.success(f"🎉 สร้างไฟล์เสียงสำเร็จ 100%! (ใช้เวลาทั้งหมด {total_duration:.1f}วินาที)")
+    status_text.success(f"🎉 สร้างไฟล์เสียงสำเร็จ 100%! (ใช้เวลาทั้งหมด {total_duration:.1f} วินาที)")
     return True
 
 st.subheader("🎙️ สร้างเสียงเปรมวดี (พร้อมระบบจับเวลา & คาดการณ์เวลาเสร็จ)")
