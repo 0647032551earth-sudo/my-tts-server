@@ -1,5 +1,5 @@
 import streamlit as st
-from gtts import gTTS
+from gTTS import gTTS
 import os
 
 # ตั้งค่าหน้าเว็บ
@@ -37,4 +37,29 @@ lang_code = lang_map[selected_lang_name]
 st.markdown("---")
 
 # ส่วนประมวลผลและสร้างไฟล์ MP3
-if st.button("📥 สร้าง
+if st.button("สร้างและดาวน์โหลดไฟล์ MP3 อัตโนมัติ", type="primary", use_container_width=True):
+    if not text.strip():
+        st.warning("⚠️ กรุณากรอกข้อความก่อนสร้างไฟล์ครับ")
+    else:
+        with st.spinner("⏳ กำลังประมวลผลสร้างไฟล์ MP3 ของแท้..."):
+            try:
+                # สร้างไฟล์ MP3 ด้วย gTTS
+                tts = gTTS(text=text, lang=lang_code, slow=False)
+                file_path = "speech_output.mp3"
+                tts.save(file_path)
+                
+                # อ่านไฟล์มาเตรียมดาวน์โหลด
+                with open(file_path, "rb") as f:
+                    audio_bytes = f.read()
+                
+                st.success("✅ สร้างไฟล์ MP3 สำเร็จเรียบร้อย!")
+                
+                # เล่นเสียงตัวอย่างบนเว็บ
+                st.audio(audio_bytes, format="audio/mp3")
+                
+                # ปุ่มดาวน์โหลดไฟล์ MP3 ลงเครื่อง
+                st.download_button(
+                    label="คลิกที่นี่เพื่อดาวน์โหลดไฟล์ MP3 ลงเครื่องทันที",
+                    data=audio_bytes,
+                    file_name=f"speech-{lang_code}-{int(os.path.getmtime(file_path))}.mp3",
+                    mime="audio/mp3",
