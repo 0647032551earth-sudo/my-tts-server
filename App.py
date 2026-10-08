@@ -96,7 +96,7 @@ if st.button("🚀 สั่งดึงและแปล (ความเร�
                 next_link = None
                 for a in soup.find_all('a', href=True):
                     text_a = a.get_text().lower()
-                    if 'next' in text_a || 'ถัดไป' in text_a || '>>' in text_a || '下一页' in text_a:
+                    if 'next' in text_a or 'ถัดไป' in text_a or '>>' in text_a or '下一页' in text_a:
                         next_link = a['href']
                         break
                 
@@ -122,7 +122,7 @@ if st.button("🚀 สั่งดึงและแปล (ความเร�
         else:
             status_text.error("❌ การดึงและแปลข้อมูลล้มเหลวทั้งหมด")
 
-# 2. ช่องข้อความตรวจสอบและแก้ไข + ตัวนับจำนวนตัวอักษร (Character Counter กลับมาแล้ว)
+# 2. ช่องข้อความตรวจสอบและแก้ไข + ตัวนับจำนวนตัวอักษร
 st.subheader("✍️ ตรวจสอบ แก้ไข และขัดเกลาข้อความภาษาไทย")
 st.session_state.novel_text = st.text_area("ข้อความภาษาไทยสำหรับสร้างเสียงเปรมวดี:", value=st.session_state.novel_text, height=300)
 
@@ -142,7 +142,7 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# ฟังก์ชันสร้างเสียงจริงแบบไม่หลอกตา (ตัดสليبปลอมออก ทำงานจริงจังเพื่อไม่ให้ค้าง)
+# ฟังก์ชันสร้างเสียงจริงแบบไม่หลอกตา
 async def generate_audio_real(text_content, voice, output_file, status_callback):
     status_callback("กำลังเชื่อมต่อระบบสังเคราะห์เสียงเปรมวดี...")
     communicate = edge_tts.Communicate(text_content, voice)
@@ -150,7 +150,7 @@ async def generate_audio_real(text_content, voice, output_file, status_callback)
     await communicate.save(output_file)
     status_callback("สร้างไฟล์เสียงสำเร็จเรียบร้อย!")
 
-# 4. ปุ่มสร้างเสียงเปรมวดี (แบบเรียลไทม์ ไม่ค้างที่ 70%)
+# 4. ปุ่มสร้างเสียงเปรมวดี
 st.subheader("🎙️ สร้างเสียงเปรมวดี (ความเร็วสูงและใช้งานจริง)")
 if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (MP3)"):
     if st.session_state.novel_text.strip() == "":
@@ -164,7 +164,6 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
         try:
             output_file = "premwadee_final_translated.mp3"
             
-            # รันการสร้างเสียงจริงโดยไม่มีการหน่วงเวลาปลอมๆ
             asyncio.run(generate_audio_real(st.session_state.novel_text, "th-TH-PremwadeeNeural", output_file, update_status))
             
             if os.path.exists(output_file):
@@ -181,4 +180,6 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
                     mime="audio/mp3"
                 )
             else:
-                status_box.error("❌ ล
+                status_box.error("❌ ล้มเหลว: ไม่พบไฟล์เสียงที่ถูกสร้างขึ้นในระบบ")
+        except Exception as audio_err:
+            status_box.error(f"❌ เกิดข้อผิดพลาดในการสร้างเสียงเปรมวดี: {str(audio_err)}")
