@@ -1,2 +1,4 @@
 streamlit
 edge-tts
+requests
+beautifulsoup4
