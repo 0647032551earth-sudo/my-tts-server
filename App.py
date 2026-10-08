@@ -8,9 +8,9 @@ import re
 import os
 import time
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Live ETA Timer)", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Turbo Auto-Recovery)", page_icon="🌐")
 
-st.title("🌐 ระบบดึงนิยาย + แปลไทย + สร้างเสียงเปรมวดี (จับเวลา & คำนวณเวลาเสร็จจริง)")
+st.title("🌐 ระบบดึงนิยาย + แปลไทย + สร้างเสียงเปรมวดี (Turbo & Auto-Recovery)")
 
 # กำหนดค่าเริ่มต้นใน session_state ป้องกันข้อมูลหาย
 if "novel_text" not in st.session_state:
@@ -147,15 +147,15 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# 4. ฟังก์ชันสร้างเสียง พร้อมระบบแบ่งย่อยปลอดภัยและป้องกัน Error 'No audio was received'
-async def generate_audio_chunks_with_eta(text_content, voice, output_filename, progress_bar, status_text):
-    # ทำความสะอาดข้อความ ตัดตัวอักษรควบคุมพิเศษออกเพื่อไม่ให้ Edge TTS เออเร่อ
+# 4. ฟังก์ชันสร้างเสียง Turbo + Auto-Recovery (ลื่นไหล รวดเร็ว และแก้ไขข้อผิดพลาดอัตโนมัติ)
+async def generate_audio_chunks_turbo(text_content, voice, output_filename, progress_bar, status_text):
+    # ทำความสะอาดข้อความ ป้องกันอักขระแปลกปลอม
     clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text_content)
     
-    # แบ่งประโยคให้ย่อยลง (ขนาด 1,000 ตัวอักษรต่อก้อน ป้องกันความผิดพลาด)
-    chunk_size = 1000
+    # เพิ่มขนาดก้อนให้ใหญ่ขึ้นเล็กน้อย (1,500 ตัวอักษร) เพื่อลดจำนวนรอบและทำให้เร็วขึ้น
+    chunk_size = 1500
     text_chunks = [clean_text[i:i+chunk_size] for i in range(0, len(clean_text), chunk_size)]
-    text_chunks = [c.strip() for c in text_chunks if c.strip()] # กรองก้อนที่ว่างเปล่าออก
+    text_chunks = [c.strip() for c in text_chunks if c.strip()]
     
     total_chunks = len(text_chunks)
     total_chars = len(clean_text)
@@ -165,16 +165,23 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
 
     temp_files = [f"temp_part_{idx}.mp3" for idx in range(total_chunks)]
     
-    async def process_chunk(idx, chunk):
-        try:
-            communicate = edge_tts.Communicate(chunk, voice)
-            await communicate.save(temp_files[idx])
-        except Exception:
-            # ถ้าก้อนไหนพัง ให้สร้างไฟล์เสียงว่างเปล่าหรือข้ามเพื่อไม่ให้ล่มทั้งระบบ
-            with open(temp_files[idx], "wb") as f:
-                f.write(b"")
+    # ฟังก์ชันตัวช่วยสร้างเสียง พร้อมระบบ Auto-Retry อัตโนมัติถ้าเกิด Error
+    async def process_chunk_with_retry(idx, chunk):
+        for attempt in range(3): # ลองใหม่สูงสุด 3 ครั้งถ้าพลาด
+            try:
+                communicate = edge_tts.Communicate(chunk, voice)
+                await communicate.save(temp_files[idx])
+                return True
+            except Exception:
+                await asyncio.sleep(0.5) # พักแป๊บหนึ่งแล้วลองใหม่
+        
+        # ถ้าพยายามครบ 3 ครั้งแล้วยังพัง ให้สร้างไฟล์ว่างข้ามไปอัตโนมัติโดยไม่ทำแอปพัง
+        with open(temp_files[idx], "wb") as f:
+            f.write(b"")
+        return False
 
-    batch_size = 3
+    # เพิ่มความเร็วด้วยการประมวลผลพร้อมกันกลุ่มละ 5 ก้อน (Turbo Mode)
+    batch_size = 5
     completed_count = 0
     processed_chars = 0
     start_time = time.time()
@@ -182,14 +189,14 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
     for i in range(0, total_chunks, batch_size):
         batch_indices = range(i, min(i + batch_size, total_chunks))
         
-        batch_tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
+        batch_tasks = [process_chunk_with_retry(idx, text_chunks[idx]) for idx in batch_indices]
         await asyncio.gather(*batch_tasks)
         
         completed_count += len(batch_indices)
         for idx in batch_indices:
             processed_chars += len(text_chunks[idx])
         
-        # คำนวณเวลาที่ใช้ไป, ความเร็ว และ ETA
+        # คำนวณเวลา, ความเร็ว (ตัวอักษร/วินาที) และ ETA แบบเรียลไทม์
         elapsed_time = max(time.time() - start_time, 0.1)
         chars_per_sec = processed_chars / elapsed_time
         
@@ -200,9 +207,9 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
         progress_bar.progress(min(current_pct, 100))
         
         status_text.markdown(f"""
-        🎧 **กำลังสังเคราะห์เสียงเปรมวดี...** ({current_pct}%)<br>
+        🚀 **[Turbo Mode] กำลังสังเคราะห์เสียงเปรมวดี...** ({current_pct}%)<br>
         ⏱️ ทำงานไปแล้ว: **{elapsed_time:.1f} วินาที**<br>
-        ⚡ ความเร็ว: **{chars_per_sec:.1f} ตัวอักษร/วินาที**<br>
+        ⚡ ความเร็ว: **{chars_per_sec:.1f} ตัวอักษร / 1 วินาที**<br>
         ⏳ จะเสร็จในอีกประมาณ: **{eta_seconds:.1f} วินาที** (เหลืออีก {max(remaining_chars, 0):,} ตัวอักษร)
         """, unsafe_allow_html=True)
 
@@ -222,8 +229,8 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
     status_text.success(f"🎉 สร้างไฟล์เสียงสำเร็จ 100%! (ใช้เวลาทั้งหมด {total_duration:.1f} วินาที)")
     return True
 
-st.subheader("🎙️ สร้างเสียงเปรมวดี (พร้อมระบบจับเวลา & คาดการณ์เวลาเสร็จ)")
-if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (MP3)"):
+st.subheader("🎙️ สร้างเสียงเปรมวดี (Turbo & Auto-Recovery)")
+if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (Turbo MP3)"):
     if st.session_state.novel_text.strip() == "":
         st.warning("⚠️ กรุณามีข้อความสำหรับสร้างเสียงก่อนครับ")
     else:
@@ -233,7 +240,7 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
         try:
             output_file = "premwadee_final_translated.mp3"
             
-            success = asyncio.run(generate_audio_chunks_with_eta(
+            success = asyncio.run(generate_audio_chunks_turbo(
                 st.session_state.novel_text, 
                 "th-TH-PremwadeeNeural", 
                 output_file, 
@@ -248,7 +255,7 @@ if st.button("🎙️ เริ่มสร้างไฟล์เสียง�
                 st.audio(audio_bytes, format="audio/mp3")
                 
                 st.download_button(
-                    label="📥 ดาวน์โหลดไฟล์ MP3 เสียงเปรมวดี",
+                    label="📥 ดาวน์โหลดไฟล์ MP3 เสียงเปรมวดี (Turbo)",
                     data=audio_bytes,
                     file_name="premwadee_novel_translated.mp3",
                     mime="audio/mp3"
