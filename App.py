@@ -1,229 +1,376 @@
-import streamlit as st
+"""Novel to Speech - Batch (เวอร์ชันปรับปรุงสมบูรณ์ พร้อมดาวน์โหลด ZIP)
+
+ติดตั้ง:  pip install streamlit edge-tts requests beautifulsoup4
+รัน:      streamlit run app.py
+"""
 import asyncio
-import edge_tts
+import hashlib
+import json
+import os
+import re
+import time
+import urllib.parse
+import zipfile
+import io
+
 import requests
 from bs4 import BeautifulSoup
-import urllib.parse
-import re
-import os
-import time
 
-st.set_page_config(page_title="Novel to Speech - Auto Rename Batch", page_icon="📦")
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
 
-st.title("📦 ระบบดึงนิยายแบ่งเป็นชุด + ตั้งชื่อไฟล์ + ดาวน์โหลดอัตโนมัติ")
+try:
+    import streamlit as st
+except ImportError:
+    st = None
 
-if "novel_text" not in st.session_state:
-    st.session_state.novel_text = "วางลิงก์ตอนเริ่มต้นด้านบน แล้วกำหนดช่วงตอนและขนาดชุดที่ต้องการได้เลยครับ"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+OUTPUT_ROOT = "output"
+TTS_PART_CHARS = 1500
+TTS_PARALLEL = 2
+NEXT_MARKERS = ("next", "ถัดไป", ">>", "下一页", "下一章", "下一頁", "次へ")
 
-def fast_translate(text, src_lang='auto', dest_lang='th'):
+
+def clean_text(text):
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text or "")
+
+
+def split_text(text, limit):
+    parts, buf = [], ""
+
+    def flush():
+        nonlocal buf
+        if buf.strip():
+            parts.append(buf.strip())
+        buf = ""
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        while len(line) > limit:
+            cut = max(
+                line.rfind(ch, 0, limit)
+                for ch in ("。", "！", "？", ". ", "! ", "? ", "；", "，", ", ", " ")
+            )
+            if cut < limit // 3:
+                cut = limit - 1
+            flush()
+            parts.append(line[: cut + 1].strip())
+            line = line[cut + 1:].strip()
+        if len(buf) + len(line) + 1 > limit:
+            flush()
+        buf += line + "\n"
+    flush()
+    return [p for p in parts if p]
+
+
+def translate_text(text, src_lang="auto", dest_lang="th", tries=3):
     if not text.strip():
         return text
-    try:
-        max_chunk = 3000
-        chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
-        translated_full = []
-        for chunk in chunks:
-            url = "https://translate.googleapis.com/translate_a/single"
-            params = {"client": "gtx", "sl": src_lang, "tl": dest_lang, "dt": "t", "q": chunk}
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = requests.get(url, params=params, headers=headers, timeout=10)
-            if response.status_code == 200:
-                res_json = response.json()
-                translated_chunk = "".join([item[0] for item in res_json[0] if item[0]])
-                translated_full.append(translated_chunk)
-            else:
-                translated_full.append(chunk)
-        return "".join(translated_full)
-    except Exception:
-        return text
-
-# ฟังก์ชันแปลงเสียงย่อยแบบขนาน (Parallel TTS) พร้อมระบบป้องกัน Error
-async def text_to_speech_fast(text, voice, output_file):
-    clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
-    sub_chunk_size = 2000
-    sub_chunks = [clean_text[i:i+sub_chunk_size] for i in range(0, len(clean_text), sub_chunk_size)]
-    sub_chunks = [c.strip() for c in sub_chunks if c.strip()]
-    
-    if not sub_chunks:
-        with open(output_file, "wb") as f:
-            f.write(b"")
-        return
-
-    sub_files = [f"sub_{os.getpid()}_{idx}.mp3" for idx in range(len(sub_chunks))]
-    
-    async def fetch_sub(s_idx, s_text):
-        for _ in range(3):
+    out = []
+    for chunk in split_text(text, 3000):
+        last = None
+        for a in range(tries):
             try:
-                communicate = edge_tts.Communicate(s_text, voice)
-                await communicate.save(sub_files[s_idx])
-                return
-            except Exception:
-                await asyncio.sleep(0.5)
-        with open(sub_files[s_idx], "wb") as f:
-            f.write(b"")
+                r = requests.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={"client": "gtx", "sl": src_lang, "tl": dest_lang, "dt": "t", "q": chunk},
+                    headers=HEADERS,
+                    timeout=15,
+                )
+                r.raise_for_status()
+                out.append("".join(item[0] for item in r.json()[0] if item[0]))
+                break
+            except Exception as e:
+                last = e
+                time.sleep(1.5 * (a + 1))
+        else:
+            raise RuntimeError(f"แปลไม่สำเร็จ: {last}")
+    return "\n".join(out)
 
-    tasks = [fetch_sub(idx, chunk) for idx, chunk in enumerate(sub_chunks)]
-    await asyncio.gather(*tasks)
 
-    with open(output_file, "wb") as outfile:
-        for sf in sub_files:
-            if os.path.exists(sf) and os.path.getsize(sf) > 0:
-                with open(sf, "rb") as sf_in:
-                    outfile.write(sf_in.read())
-                os.remove(sf)
+def fetch_page(url, tries=3):
+    last = None
+    for a in range(tries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            if (r.encoding or "").lower() == "iso-8859-1":
+                r.encoding = r.apparent_encoding
+            return BeautifulSoup(r.text, "html.parser")
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (a + 1))
+    raise RuntimeError(f"โหลดหน้าเว็บไม่ได้: {last}")
 
-# ตั้งค่าหน้าจอการใช้งาน
-st.subheader("🔗 ตั้งค่าช่วงตอนและขนาดชุด (Batch Settings)")
-start_url = st.text_input("วางลิงก์หน้าเว็บนิยาย 'ตอนเริ่มต้น':", "")
 
-col_1, col_2, col_3 = st.columns(3)
-with col_1:
-    start_ep = st.number_input("เริ่มต้นที่ตอนที่:", min_value=1, value=1)
-with col_2:
-    end_ep = st.number_input("สิ้นสุดที่ตอนที่ (เช่น 500):", min_value=1, value=100)
-with col_3:
-    batch_size = st.number_input("จำนวนตอนต่อ 1 ชุด (Batch):", min_value=1, value=50)
+def extract_text(soup):
+    for tag in soup(["script", "style", "noscript", "nav", "header", "footer"]):
+        tag.decompose()
+    text = "\n".join(p.get_text() for p in soup.find_all("p"))
+    if len(text.strip()) < 10:
+        text = soup.get_text("\n")
+    return text
 
-col_4, col_5 = st.columns(2)
-with col_4:
-    src_lang = st.selectbox("ภาษาต้นทาง:", ["auto", "zh-CN", "en", "ja"], index=0)
-with col_5:
-    voice_choice = st.selectbox("เลือกเสียงพากย์:", ["th-TH-PremwadeeNeural", "th-TH-NiwatNeural"], index=0)
 
-# ช่องแสดงข้อความ
-st.subheader("✍️ ข้อความนิยายภาพรวม")
-st.session_state.novel_text = st.text_area("ข้อความภาษาไทยสำหรับสร้างเสียง:", value=st.session_state.novel_text, height=180)
+def increment_url(url):
+    p = urllib.parse.urlparse(url)
 
-char_count = len(st.session_state.novel_text)
-st.caption(f"📊 สถิติข้อความปัจจุบัน: **{char_count:,}** ตัวอักษร")
+    def bump(s):
+        m = re.search(r"(\d+)(\D*)$", s)
+        if not m:
+            return None
+        n = str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+        return s[: m.start(1)] + n + m.group(2)
 
-col_btn1, col_btn2 = st.columns(2)
-with col_btn1:
-    if st.button("✨ ขัดเกลาข้อความให้อ่านง่ายขึ้น"):
-        cleaned = re.sub(r'\n\s*\n', '\n\n', st.session_state.novel_text)
-        st.session_state.novel_text = re.sub(r'[ \t]+', ' ', cleaned)
-        st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
+    path = bump(p.path)
+    if path is not None:
+        return urllib.parse.urlunparse(p._replace(path=path))
+    q = bump(p.query)
+    if q is not None:
+        return urllib.parse.urlunparse(p._replace(query=q))
+    return None
+
+
+def find_next_url(soup, current_url):
+    tag = soup.find(["a", "link"], rel=lambda v: v and "next" in v, href=True)
+    if tag:
+        return urllib.parse.urljoin(current_url, tag["href"])
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        txt = a.get_text().strip().lower()
+        if not href or href.startswith(("#", "javascript:")) or len(txt) > 20:
+            continue
+        if any(m in txt for m in NEXT_MARKERS):
+            return urllib.parse.urljoin(current_url, href)
+    return None
+
+
+async def tts_to_file(text, voice, out_path, parallel=TTS_PARALLEL, tries=5, backoff=1.0):
+    parts = split_text(clean_text(text), TTS_PART_CHARS)
+    if not parts:
+        raise ValueError("ไม่มีข้อความให้แปลงเสียง")
+    sem = asyncio.Semaphore(parallel)
+    tmp = [f"{out_path}.part{i}" for i in range(len(parts))]
+
+    async def one(i, p):
+        async with sem:
+            last = None
+            for a in range(tries):
+                try:
+                    await edge_tts.Communicate(p, voice).save(tmp[i])
+                    if os.path.getsize(tmp[i]) < 100:
+                        raise RuntimeError("ได้ไฟล์เสียงว่าง")
+                    return
+                except Exception as e:
+                    last = e
+                    await asyncio.sleep(min(30, backoff * (2 ** a)))
+            raise RuntimeError(f"ช่วงเสียง {i + 1}/{len(parts)} ล้มเหลว: {last}")
+
+    try:
+        results = await asyncio.gather(*[one(i, p) for i, p in enumerate(parts)], return_exceptions=True)
+        errs = [r for r in results if isinstance(r, Exception)]
+        if errs:
+            raise errs[0]
+        with open(out_path, "wb") as out:
+            for t in tmp:
+                with open(t, "rb") as f:
+                    out.write(f.read())
+    finally:
+        for t in tmp:
+            if os.path.exists(t):
+                os.remove(t)
+
+
+def work_dir_for(start_url, voice):
+    key = hashlib.md5(f"{start_url}|{voice}".encode()).hexdigest()[:8]
+    d = os.path.join(OUTPUT_ROOT, key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def load_cp(d):
+    p = os.path.join(d, "checkpoint.json")
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"eps": {}, "failed": {}}
+
+
+def save_cp(d, cp):
+    with open(os.path.join(d, "checkpoint.json"), "w", encoding="utf-8") as f:
+        json.dump(cp, f, ensure_ascii=False)
+
+
+def merge_files(files, out_path):
+    with open(out_path, "wb") as out:
+        for f in files:
+            with open(f, "rb") as src:
+                out.write(src.read())
+
+
+def fmt_secs(s):
+    s = int(s)
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def run_batches(start_url, start_ep, end_ep, batch_size, src_lang, voice, ui):
+    d = work_dir_for(start_url, voice)
+    cp = load_cp(d)
+    total = end_ep - start_ep + 1
+    num_batches = (total + batch_size - 1) // batch_size
+    ui["info"](f"ทั้งหมด {total} ตอน แบ่งเป็น {num_batches} ชุด (ชุดละประมาณ {batch_size} ตอน)")
+    t0, done = time.time(), 0
+    current_url = start_url
+    batches = []
+
+    for b in range(num_batches):
+        b_start = start_ep + b * batch_size
+        b_end = min(b_start + batch_size - 1, end_ep)
+        ok_files = []
+        for ep in range(b_start, b_end + 1):
+            ui["status"](f"ชุดที่ {b + 1}/{num_batches}  ตอนที่ {ep}  (เสร็จแล้ว {done}/{total}, ใช้เวลา {fmt_secs(time.time() - t0)})")
+            rec = cp["eps"].get(str(ep))
+            if rec and os.path.exists(rec["file"]):
+                ok_files.append(rec["file"])
+                current_url = rec.get("next_url") or current_url
+                done += 1
+                ui["progress"](done / total)
+                continue
+
+            ep_file = os.path.join(d, f"ep_{ep:04d}.mp3")
+            nxt = None
+            try:
+                soup = fetch_page(current_url)
+                nxt = find_next_url(soup, current_url) or increment_url(current_url)
+                text = extract_text(soup)
+                thai = translate_text(text, src_lang=src_lang)
+                asyncio.run(tts_to_file(thai, voice, ep_file))
+                cp["eps"][str(ep)] = {"file": ep_file, "url": current_url, "next_url": nxt}
+                cp["failed"].pop(str(ep), None)
+                ok_files.append(ep_file)
+                ui["preview"](thai[:1500])
+            except Exception as e:
+                cp["failed"][str(ep)] = f"{type(e).__name__}: {e}"
+                ui["warn"](f"ตอนที่ {ep} ล้มเหลว: {e}")
+                if nxt is None:
+                    nxt = increment_url(current_url)
+            save_cp(d, cp)
+            done += 1
+            ui["progress"](done / total)
+            if not nxt or nxt == current_url:
+                ui["warn"]("หาลิงก์ตอนถัดไปไม่ได้ หยุดการทำงาน (กดเริ่มใหม่เพื่อทำต่อจากที่ค้าง)")
+                return batches, cp
+            current_url = nxt
+
+        if ok_files:
+            name = os.path.join(d, f"novel_ep_{b_start}_to_{b_end}.mp3")
+            merge_files(ok_files, name)
+            batches.append((f"ตอนที่ {b_start} ถึง {b_end}", name))
+            ui["batch"](batches)
+    return batches, cp
+
+
+def main():
+    st.set_page_config(page_title="Novel to Speech", page_icon="📦")
+    st.title("📦 ดึงนิยาย แปลไทย แปลงเสียง แบ่งชุด (อัตโนมัติข้ามคืน)")
+    st.caption("ระบบทำงานต่อเนื่อง มี Checkpoint ป้องกันหลุด และรวมไฟล์ดาวน์โหลดเป็น ZIP ได้")
+
+    st.session_state.setdefault("novel_text", "")
+    st.session_state.setdefault("batches", [])
+
+    start_url = st.text_input("ลิงก์ตอนเริ่มต้น:", "")
+    c1, c2, c3 = st.columns(3)
+    start_ep = c1.number_input("เริ่มที่ตอน:", min_value=1, value=1)
+    end_ep = c2.number_input("สิ้นสุดที่ตอน:", min_value=1, value=100)
+    batch_size = c3.number_input("ตอนต่อชุด:", min_value=1, value=50)
+    c4, c5 = st.columns(2)
+    src_lang = c4.selectbox("ภาษาต้นทาง:", ["auto", "zh-CN", "en", "ja"])
+    voice = c5.selectbox("เสียง:", ["th-TH-PremwadeeNeural", "th-TH-NiwatNeural"])
+
+    st.subheader("✍️ ข้อความตัวอย่าง")
+    st.session_state.novel_text = st.text_area("ข้อความภาษาไทย:", value=st.session_state.novel_text, height=160)
+
+    b1, b2, b3 = st.columns(3)
+    if b1.button("✨ จัดระเบียบข้อความ"):
+        t = re.sub(r"\n\s*\n", "\n\n", st.session_state.novel_text)
+        st.session_state.novel_text = re.sub(r"[ \t]+", " ", t)
         st.rerun()
-with col_btn2:
-    if st.button("🗑️ ล้างข้อความทั้งหมด"):
+    if b2.button("🗑️ ล้างข้อความ"):
         st.session_state.novel_text = ""
         st.rerun()
+    if b3.button("🔊 แปลงข้อความนี้เดี่ยวๆ"):
+        txt = st.session_state.novel_text.strip()
+        if not txt:
+            st.warning("ยังไม่มีข้อความ")
+        else:
+            os.makedirs(OUTPUT_ROOT, exist_ok=True)
+            path = os.path.join(OUTPUT_ROOT, "manual.mp3")
+            try:
+                with st.spinner("กำลังแปลงเสียง..."):
+                    asyncio.run(tts_to_file(txt, voice, path))
+                with open(path, "rb") as f:
+                    data = f.read()
+                st.audio(data, format="audio/mp3")
+                st.download_button("📥 ดาวน์โหลด MP3", data, "manual.mp3", "audio/mp3")
+            except Exception as e:
+                st.error(str(e))
 
-# ปุ่มเริ่มกระบวนการแบ่งชุด พร้อมระบบกู้คืนตัวเองและแสดงปุ่มดาวน์โหลด
-st.subheader("🎙️ ระบบแปลงและดาวน์โหลดทีละชุด (Auto-Recovery & Download)")
-if st.button("🚀 เริ่มต้นแปลงนิยายแบบแบ่งชุดอัตโนมัติ (ยาวข้ามคืนได้)"):
-    if start_url.strip() == "":
-        st.warning("⚠️ กรุณากรอกลิงก์เริ่มต้นก่อนครับ")
-    elif end_ep < start_ep:
-        st.warning("⚠️ ตอนสิ้นสุดต้องมากกว่าหรือเท่ากับตอนเริ่มต้นครับ")
-    else:
-        total_episodes = (end_ep - start_ep) + 1
-        num_batches = (total_episodes + batch_size - 1) // batch_size
+    st.subheader("🎙️ แปลงนิยายแบบแบ่งชุดข้ามคืน")
+    if st.button("🚀 เริ่ม / ทำต่อ"):
+        if not start_url.strip():
+            st.warning("กรอกลิงก์เริ่มต้นก่อน")
+        elif end_ep < start_ep:
+            st.warning("ตอนสิ้นสุดต้องไม่น้อยกว่าตอนเริ่มต้น")
+        else:
+            bar, status = st.progress(0), st.empty()
+            ui = {
+                "info": st.info,
+                "status": status.markdown,
+                "progress": lambda x: bar.progress(min(max(x, 0.0), 1.0)),
+                "warn": st.warning,
+                "preview": lambda t: st.session_state.__setitem__("novel_text", t),
+                "batch": lambda b: st.session_state.__setitem__("batches", list(b)),
+            }
+            batches, cp = run_batches(start_url.strip(), int(start_ep), int(end_ep), int(batch_size), src_lang, voice, ui)
+            st.session_state.batches = batches
+            if cp["failed"]:
+                st.error("ตอนที่ล้มเหลว: " + ", ".join(sorted(cp["failed"], key=int)))
+            else:
+                status.success("เสร็จทุกชุดเรียบร้อย!")
+
+    if st.session_state.batches:
+        st.markdown("---")
+        st.subheader("📥 ดาวน์โหลดไฟล์แยกตามชุด หรือดาวน์โหลดรวมทั้งหมดเป็น ZIP")
         
-        st.info(f"ℹ️ ระบบจะทำการแบ่งตอนทั้งหมด {total_episodes} ตอน ออกเป็น **{num_batches} ชุด** (ชุดละประมาณ {batch_size} ตอน)")
+        # เพิ่มปุ่มดาวน์โหลดรวบยอดเป็น ZIP
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for title, path in st.session_state.batches:
+                if os.path.exists(path):
+                    zip_file.write(path, os.path.basename(path))
+        zip_buffer.seek(0)
         
-        overall_progress = st.progress(0)
-        status_display = st.empty()
-        
-        current_url = start_url
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        
-        global_start_time = time.time()
-        completed_episodes_count = 0
-        
-        downloadable_batches = []
-        
-        for batch_idx in range(num_batches):
-            batch_start_ep = start_ep + (batch_idx * batch_size)
-            batch_end_ep = min(start_ep + ((batch_idx + 1) * batch_size) - 1, end_ep)
-            
-            status_display.markdown(f"📦 **กำลังประมวลผลชุดที่ {batch_idx + 1} / {num_batches}** (ตอนที่ {batch_start_ep} ถึง {batch_end_ep})")
-            
-            batch_chapter_texts = []
-            batch_audio_files = []
-            
-            current_batch_total = (batch_end_ep - batch_start_ep) + 1
-            for b_i in range(current_batch_total):
-                actual_ep_num = batch_start_ep + b_i
-                completed_episodes_count += 1
-                
-                pct = int((completed_episodes_count / total_episodes) * 100)
-                overall_progress.progress(max(min(pct, 100), 1))
-                
-                # ระบบป้องกัน Error ข้ามตอนอัตโนมัติหากเว็บมีปัญหา
-                for attempt in range(2):
-                    try:
-                        res = requests.get(current_url, headers=headers, timeout=10)
-                        if res.status_code == 200:
-                            soup = BeautifulSoup(res.text, 'html.parser')
-                            paragraphs = soup.find_all('p')
-                            raw_content = "\n".join([p.get_text() for p in paragraphs])
-                            if len(raw_content.strip()) < 10:
-                                raw_content = soup.get_text()
-
-                            translated_content = fast_translate(raw_content, src_lang=src_lang, dest_lang='th')
-                            
-                            formatted_ch = f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content
-                            batch_chapter_texts.append(formatted_ch)
-                            
-                            ch_audio_file = f"batch_{batch_idx}_ch_{actual_ep_num}.mp3"
-                            batch_audio_files.append(ch_audio_file)
-                            
-                            asyncio.run(text_to_speech_fast(translated_content, voice_choice, ch_audio_file))
-                            
-                            # ค้นหาลิงก์ตอนถัดไป
-                            next_link = None
-                            for a in soup.find_all('a', href=True):
-                                text_a = a.get_text().lower()
-                                if 'next' in text_a or 'ถัดไป' in text_a or '>>' in text_a or '下一页' in text_a:
-                                    next_link = a['href']
-                                    break
-                            
-                            if next_link:
-                                current_url = next_link if next_link.startswith('http') else urllib.parse.urljoin(current_url, next_link)
-                            else:
-                                if re.search(r'-\d+$', current_url):
-                                    current_url = re.sub(r'-\d+$', lambda m: f"-{int(m.group(1)[1:])+1}", current_url)
-                            break
-                    except Exception:
-                        time.sleep(1)
-
-            # รวมไฟล์เสียงประจำชุด และตั้งชื่อไฟล์ตามช่วงตอนจริงอัตโนมัติ
-            if batch_audio_files:
-                batch_filename = f"novel_ep_{batch_start_ep}_to_{batch_end_ep}.mp3"
-                with open(batch_filename, "wb") as batch_out:
-                    for caf in batch_audio_files:
-                        if os.path.exists(caf) and os.path.getsize(caf) > 0:
-                            with open(caf, "rb") as caf_in:
-                                batch_out.write(caf_in.read())
-                            os.remove(caf)
-                
-                if os.path.exists(batch_filename):
-                    with open(batch_filename, "rb") as bf:
-                        b_bytes = bf.read()
-                    downloadable_batches.append((f"ตอนที่ {batch_start_ep} ถึง {batch_end_ep}", b_bytes, batch_filename))
-
-            if batch_chapter_texts:
-                st.session_state.novel_text += "".join(batch_chapter_texts)
-
-        overall_progress.progress(100)
-        total_elapsed = time.time() - global_start_time
-        status_display.success(f"🎉 ประมวลผลเสร็จสิ้นทุกชุด! ใช้เวลาไปทั้งหมด {int(total_elapsed)} วินาที")
-
-        # 📥 บันทึกรายการไฟล์ลงใน Session State เพื่อให้ปุ่มดาวน์โหลดแสดงผลคงอยู่ตลอดไป
-        st.session_state.downloadable_batches = downloadable_batches
-
-    # 📥 แสดงส่วนปุ่มดาวน์โหลด (ดึงมาจาก Session State ป้องกันปุ่มหาย)
-if "downloadable_batches" in st.session_state and st.session_state.downloadable_batches:
-    st.markdown("---")
-    st.subheader("📥 ดาวน์โหลดไฟล์เสียงแยกตามชุด (พร้อมชื่อตอนอัตโนมัติ)")
-    for title, data_bytes, filename in st.session_state.downloadable_batches:
-        st.markdown(f"🎵 **ไฟล์: `{filename}`**")
-        st.audio(data_bytes, format="audio/mp3")
         st.download_button(
-            label=f"📥 ดาวน์โหลด {title} ({filename})",
-            data=data_bytes,
-            file_name=filename,
-            mime="audio/mp3",
-            key=filename
+            label="📦 ดาวน์โหลดทุกชุดรวมกันเป็นไฟล์ ZIP เดียว",
+            data=zip_buffer,
+            file_name="all_novel_batches.zip",
+            mime="application/zip",
+            type="primary"
         )
+        
+        st.markdown("")
+        for title, path in st.session_state.batches:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    st.download_button(f"📥 {title} ({os.path.basename(path)})", f, os.path.basename(path), "audio/mp3", key=path)
+
+
+if __name__ == "__main__" and st is not None:
+    main()
