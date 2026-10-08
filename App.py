@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -47,7 +48,7 @@ import edge_tts
 # CONFIG
 # ============================================================
 
-APP_VERSION = "V7.2"
+APP_VERSION = "V7.3"
 VOICE = "th-TH-PremwadeeNeural"
 
 BASE_DIR = Path(__file__).resolve().parent / "novel_audio_jobs"
@@ -132,13 +133,40 @@ def safe_filename(name: str, max_len: int = 90) -> str:
 
 
 def atomic_write_json(path: Path, data: dict):
+    """Atomically write JSON without allowing concurrent writers to share a temp filename."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+
+    # A unique temp file is essential when Streamlit reruns and background
+    # workers can touch the same checkpoint around the same time. Using a
+    # fixed ``state.json.tmp`` lets one writer replace/delete another writer's
+    # temp file and produces Errno 2 during os.replace().
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Small retry window for transient filesystem races on hosted runners.
+        last_error = None
+        for attempt in range(4):
+            try:
+                os.replace(tmp, path)
+                return
+            except FileNotFoundError as e:
+                last_error = e
+                if attempt >= 3:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+        if last_error:
+            raise last_error
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def read_json(path: Path, default=None):
@@ -231,8 +259,13 @@ def initial_state(url: str, start: int, end: int, per_set: int) -> dict:
 
 def ensure_state(job_id: str, url: str, start: int, end: int, per_set: int):
     path = job_dir(job_id) / "state.json"
-    if not path.exists():
-        atomic_write_json(path, initial_state(url, start, end, per_set))
+    lock = get_job_lock(job_id)
+
+    # Creation must use the same per-job lock as update_state(). Otherwise a
+    # Streamlit rerun can race with a worker's first checkpoint write.
+    with lock:
+        if not path.exists():
+            atomic_write_json(path, initial_state(url, start, end, per_set))
 
 
 # ============================================================
