@@ -2,3 +2,4 @@ streamlit
 edge-tts
 requests
 beautifulsoup4
+deep-translator
