@@ -1089,6 +1089,53 @@ def refresh_progress_for_batch(job_id: str, set_start: int, set_end: int):
 
 
 # ============================================================
+# MASTER OUTPUT
+# ============================================================
+
+def build_master_zip(job_id: str):
+    """Create one ZIP containing every completed batch ZIP/MP3.
+
+    This is a convenience fallback for Android/browser environments where
+    multiple automatic downloads are blocked: one final download gets all
+    completed sets.
+    """
+    state = read_state(job_id)
+    outputs = state.get("set_outputs", {})
+    if not outputs:
+        return None
+
+    master_dir = job_dir(job_id) / "batches"
+    master_path = master_dir / "ALL_BATCHES.zip"
+    tmp_path = master_dir / f".ALL_BATCHES.{uuid.uuid4().hex}.tmp.zip"
+
+    try:
+        import zipfile
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            seen = set()
+            for set_no in sorted(outputs, key=lambda x: int(x)):
+                for key in ("zip",):
+                    raw = outputs[set_no].get(key)
+                    if not raw:
+                        continue
+                    p = Path(raw)
+                    if not p.exists() or p.stat().st_size == 0:
+                        continue
+                    arc = f"set_{int(set_no):03d}/{p.name}"
+                    if arc in seen:
+                        continue
+                    zf.write(p, arcname=arc)
+                    seen.add(arc)
+        os.replace(tmp_path, master_path)
+        return master_path
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+# ============================================================
 # MAIN JOB
 # ============================================================
 
@@ -1346,6 +1393,8 @@ def run_job(job_id: str):
                 update_state(job_id, finish_batch)
 
             # All sets complete.
+            master_path = build_master_zip(job_id)
+
             def complete_job(s):
                 s["status"] = "completed"
                 s["stage"] = "completed"
@@ -1353,6 +1402,8 @@ def run_job(job_id: str):
                 s["job_finished_at"] = now_ts()
                 s["last_activity_at"] = now_ts()
                 s["overall_completed"] = s["total_episodes"]
+                if master_path:
+                    s["master_output"] = str(master_path)
 
             update_state(job_id, complete_job)
 
@@ -1414,10 +1465,10 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🎧 NOVEL AUDIO FACTORY V7 UNIVERSAL")
+st.title("🎧 NOVEL AUDIO FACTORY V8 AUTO DELIVERY")
 st.caption(
     "Novel → Thai → Premwadee TTS → MP3 → Batch ZIP | "
-    "Live Progress + ETA + Resume + Self-Healing"
+    "Live Progress + ETA + Resume + Self-Healing + Persistent Outputs"
 )
 
 with st.sidebar:
@@ -1432,9 +1483,9 @@ with st.sidebar:
     )
 
     st.info(
-        "หมายเหตุ: browser/Streamlit ไม่สามารถบังคับ Android "
-        "ให้ดาวน์โหลดหลายไฟล์แบบเงียบ ๆ ได้อย่างรับประกัน "
-        "จึงยังต้องกดดาวน์โหลดไฟล์จากหน้าเว็บ"
+        "ไฟล์ของทุกชุดจะถูกเก็บใน Job และแสดงปุ่มดาวน์โหลดกลับมาได้หลังรีเฟรช "
+        "แต่ Chrome/Android อาจบล็อกการดาวน์โหลดหลายไฟล์อัตโนมัติจากเว็บ "
+        "จึงไม่รับประกันการบันทึกลงเครื่องโดยไม่แตะหน้าจอ"
     )
 
 
@@ -1791,6 +1842,22 @@ if job_id:
                             key=f"mp3_{job_id}_{set_no}",
                             use_container_width=True,
                         )
+
+    # ---------------- MASTER OUTPUT ----------------
+    master_raw = state.get("master_output")
+    if master_raw:
+        master_path = Path(master_raw)
+        if master_path.exists():
+            st.markdown("### 📦 ดาวน์โหลดทั้งหมดในครั้งเดียว")
+            with master_path.open("rb") as f:
+                st.download_button(
+                    "⬇️ ดาวน์โหลดทุกชุดรวมกัน (ALL_BATCHES.zip)",
+                    data=f,
+                    file_name=master_path.name,
+                    mime="application/zip",
+                    key=f"master_{job_id}",
+                    use_container_width=True,
+                )
 
     # ---------------- STATUS ----------------
     if state.get("status") == "completed":
