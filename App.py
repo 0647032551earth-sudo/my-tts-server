@@ -7,9 +7,9 @@ import urllib.parse
 import re
 import os
 
-st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Range & Progress)", page_icon="🌐")
+st.set_page_config(page_title="Novel to Speech - เปรมวดี Pro (Real Progress)", page_icon="🌐")
 
-st.title("🌐 ระบบดึงนิยาย (ระบุช่วงตอน) + แปลไทย + สร้างเสียงเปรมวดี")
+st.title("🌐 ระบบดึงนิยาย (ระบุช่วงตอน) + แปลไทย + สร้างเสียงเปรมวดี (เปอร์เซ็นต์จริง)")
 
 # กำหนดค่าเริ่มต้นใน session_state ป้องกันข้อมูลหาย
 if "novel_text" not in st.session_state:
@@ -74,9 +74,6 @@ if st.button("🚀 สั่งดึงและแปลตามช่วง�
         total_steps = (end_ep - start_ep) + 1
         success_count = 0
         
-        # ข้ามลิงก์ไปหาตอนเริ่มต้นกรณีที่ระบุ start_ep มากกว่า 1
-        # (ระบบจะวิ่งหาปุ่ม Next ไปเรื่อยๆ จนถึงตอนที่กำหนด)
-        
         for i in range(total_steps):
             actual_ep_num = start_ep + i
             percent_complete = int((i / total_steps) * 100)
@@ -101,7 +98,6 @@ if st.button("🚀 สั่งดึงและแปลตามช่วง�
                 combined_chapters.append(f"\n\n=== ตอนที่ {actual_ep_num} ===\n\n" + translated_content)
                 success_count += 1
                 
-                # ค้นหาลิงก์ตอนถัดไป
                 next_link = None
                 for a in soup.find_all('a', href=True):
                     text_a = a.get_text().lower()
@@ -145,48 +141,70 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.warning("⚠️ ไม่มีข้อความให้ขัดเกลาครับ")
     else:
         cleaned = re.sub(r'\n\s*\n', '\n\n', st.session_state.novel_text)
-        cleaned = re.sub(r'[ \t]+', '', cleaned)
+        cleaned = re.sub(r'[ \t]+', ' ', cleaned)
         st.session_state.novel_text = cleaned
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# 4. ฟังก์ชันสร้างเสียงพร้อมเปอร์เซ็นต์ความคืบหน้า (Progress Bar สมจริง)
-async def generate_audio_with_real_progress(text_content, voice, output_file, progress_callback):
-    progress_callback(10, "กำลังเตรียมข้อมูลสร้างเสียงเปรมวดี...")
-    await asyncio.sleep(0.2)
+# 4. ฟังก์ชันสร้างเสียงแบบซอยย่อย คำนวณเปอร์เซ็นต์ความคืบหน้าตามจริง (Real Progress)
+async def generate_audio_chunks(text_content, voice, output_filename, progress_bar, status_text):
+    # ตัดแบ่งข้อความออกเป็นท่อนย่อยๆ (ประมาณ 1,500 ตัวอักษรต่อท่อน เพื่อวัดเปอร์เซ็นต์จริง)
+    chunk_size = 1500
+    text_chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+    total_chunks = len(text_chunks)
     
-    # แบ่งข้อความย่อยเพื่อจำลองเปอร์เซ็นต์ความคืบหน้าตามขนาดข้อความจริง
-    progress_callback(40, "กำลังสังเคราะห์เสียงพากย์ภาษาไทย (th-TH-PremwadeeNeural)...")
-    
-    communicate = edge_tts.Communicate(text_content, voice)
-    progress_callback(70, "กำลังเขียนไฟล์เสียง MP3 ลงระบบ...")
-    
-    await communicate.save(output_file)
-    progress_callback(100, "สร้างไฟล์เสียงสำเร็จเรียบร้อย!")
+    if total_chunks == 0:
+        return False
 
-st.subheader("🎙️ สร้างเสียงเปรมวดี (พร้อมแถบเปอร์เซ็นต์ความคืบหน้า)")
+    temp_files = []
+    for idx, chunk in enumerate(text_chunks):
+        # คำนวณเปอร์เซ็นต์ตามจำนวนท่อนที่ทำเสร็จจริง
+        current_pct = int(((idx) / total_chunks) * 100)
+        progress_bar.progress(max(current_pct, 1))
+        status_text.text(f"🎧 กำลังสังเคราะห์เสียงท่อนที่ {idx+1} จาก {total_chunks} ({current_pct}%)...")
+        
+        temp_file = f"temp_part_{idx}.mp3"
+        temp_files.append(temp_file)
+        
+        communicate = edge_tts.Communicate(chunk, voice)
+        await communicate.save(temp_file)
+
+    # รวมไฟล์ MP3 ย่อยทั้งหมดเข้าด้วยกันเป็นไฟล์เดียว
+    status_text.text("🔗 กำลังรวมไฟล์เสียงทั้งหมดเข้าด้วยกัน...")
+    progress_bar.progress(95)
+    
+    with open(output_filename, "wb") as outfile:
+        for f in temp_files:
+            if os.path.exists(f):
+                with open(f, "rb") as infile:
+                    outfile.write(infile.read())
+                os.remove(f) # ลบไฟล์ย่อยทิ้งหลังรวมเสร็จ
+
+    progress_bar.progress(100)
+    status_text.text("🎉 สร้างไฟล์เสียงสำเร็จ 100%!")
+    return True
+
+st.subheader("🎙️ สร้างเสียงเปรมวดี (เปอร์เซ็นต์จริงตามจำนวนข้อมูล)")
 if st.button("🎙️ เริ่มสร้างไฟล์เสียงเปรมวดี (MP3)"):
     if st.session_state.novel_text.strip() == "":
         st.warning("⚠️ กรุณามีข้อความสำหรับสร้างเสียงก่อนครับ")
     else:
         audio_progress = st.progress(0)
         audio_status = st.empty()
-        
-        def update_audio_progress(pct, msg):
-            audio_progress.progress(pct)
-            audio_status.text(f"🎧 {msg} ({pct}%)")
 
         try:
             output_file = "premwadee_final_translated.mp3"
             
-            asyncio.run(generate_audio_with_real_progress(
+            # รันฟังก์ชันสร้างเสียงแบบแบ่งท่อนวัดผลจริงผ่าน asyncio
+            success = asyncio.run(generate_audio_chunks(
                 st.session_state.novel_text, 
                 "th-TH-PremwadeeNeural", 
                 output_file, 
-                update_audio_progress
+                audio_progress, 
+                audio_status
             ))
             
-            if os.path.exists(output_file):
+            if success and os.path.exists(output_file):
                 with open(output_file, "rb") as f:
                     audio_bytes = f.read()
                 
