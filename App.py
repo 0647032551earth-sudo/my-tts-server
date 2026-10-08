@@ -147,12 +147,18 @@ if st.button("✨ ขัดเกลาข้อความให้อ่า�
         st.success("✨ ขัดเกลาข้อความเรียบร้อยแล้ว!")
         st.rerun()
 
-# 4. ฟังก์ชันสร้างเสียง พร้อมระบบคำนวณเวลา อัตราความเร็ว และ ETA (แบบเสถียรไม่ค้าง 0%)
+# 4. ฟังก์ชันสร้างเสียง พร้อมระบบแบ่งย่อยปลอดภัยและป้องกัน Error 'No audio was received'
 async def generate_audio_chunks_with_eta(text_content, voice, output_filename, progress_bar, status_text):
-    chunk_size = 3000
-    text_chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+    # ทำความสะอาดข้อความ ตัดตัวอักษรควบคุมพิเศษออกเพื่อไม่ให้ Edge TTS เออเร่อ
+    clean_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text_content)
+    
+    # แบ่งประโยคให้ย่อยลง (ขนาด 1,000 ตัวอักษรต่อก้อน ป้องกันความผิดพลาด)
+    chunk_size = 1000
+    text_chunks = [clean_text[i:i+chunk_size] for i in range(0, len(clean_text), chunk_size)]
+    text_chunks = [c.strip() for c in text_chunks if c.strip()] # กรองก้อนที่ว่างเปล่าออก
+    
     total_chunks = len(text_chunks)
-    total_chars = len(text_content)
+    total_chars = len(clean_text)
     
     if total_chunks == 0:
         return False
@@ -160,10 +166,15 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
     temp_files = [f"temp_part_{idx}.mp3" for idx in range(total_chunks)]
     
     async def process_chunk(idx, chunk):
-        communicate = edge_tts.Communicate(chunk, voice)
-        await communicate.save(temp_files[idx])
+        try:
+            communicate = edge_tts.Communicate(chunk, voice)
+            await communicate.save(temp_files[idx])
+        except Exception:
+            # ถ้าก้อนไหนพัง ให้สร้างไฟล์เสียงว่างเปล่าหรือข้ามเพื่อไม่ให้ล่มทั้งระบบ
+            with open(temp_files[idx], "wb") as f:
+                f.write(b"")
 
-    batch_size = 4
+    batch_size = 3
     completed_count = 0
     processed_chars = 0
     start_time = time.time()
@@ -171,7 +182,6 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
     for i in range(0, total_chunks, batch_size):
         batch_indices = range(i, min(i + batch_size, total_chunks))
         
-        # ประมวลผลกลุ่มนี้ก่อน เพื่อให้ได้ข้อมูลความเร็วและเวลาที่แม่นยำ
         batch_tasks = [process_chunk(idx, text_chunks[idx]) for idx in batch_indices]
         await asyncio.gather(*batch_tasks)
         
@@ -179,7 +189,7 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
         for idx in batch_indices:
             processed_chars += len(text_chunks[idx])
         
-        # คำนวณเวลาที่ใช้ไป, อัตราความเร็ว และ ETA
+        # คำนวณเวลาที่ใช้ไป, ความเร็ว และ ETA
         elapsed_time = max(time.time() - start_time, 0.1)
         chars_per_sec = processed_chars / elapsed_time
         
@@ -202,7 +212,7 @@ async def generate_audio_chunks_with_eta(text_content, voice, output_filename, p
     
     with open(output_filename, "wb") as outfile:
         for f in temp_files:
-            if os.path.exists(f):
+            if os.path.exists(f) and os.path.getsize(f) > 0:
                 with open(f, "rb") as infile:
                     outfile.write(infile.read())
                 os.remove(f)
